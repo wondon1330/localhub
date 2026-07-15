@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch, nextTick } from 'vue'
 import restaurantsData from './data/대전_충청권_음식점.json'
 
 const STORAGE_KEY = 'localhub-posts-v2'
@@ -15,6 +15,11 @@ const selectedRestaurant = ref(null)
 const isComposeOpen = ref(false)
 const isChatOpen = ref(false)
 const bookmarkedPostIds = ref([])
+const searchInputRef = ref(null)
+
+const isEditMode = ref(false)
+const editingPostId = ref(null)
+
 const form = ref({
   nickname: '',
   password: '',
@@ -77,12 +82,96 @@ const mapInstance = ref(null)
 const mapReady = ref(false)
 const restaurantList = ref(restaurantsData.items.slice(0, 40))
 
+// --- 카테고리 필터 관련 상태 (선택 항목에 '기타' 추가) ---
+const selectedCategory = ref('전체')
+const categoryOptions = ['전체', '한식', '일식', '중식', '양식', '카페', '기타']
+
 const tabOptions = [
-  { value: '메인', label: '메인' },
-  { value: '자유주제', label: '자유주제' },
-  { value: '가게리뷰', label: '가게리뷰' },
-  { value: '북마크', label: '북마크' },
+  { label: '메인', value: '메인' },
+  { label: '자유주제', value: '자유주제' },
+  { label: '가게리뷰', value: '가게리뷰' },
+  { label: '북마크', value: '북마크' },
 ]
+
+// --- 강화된 카테고리 자동 판별 함수 ---
+const getRestaurantType = (restaurant) => {
+  const cat = (restaurant.category || '').replace(/\s+/g, '')
+  const title = (restaurant.title || '').replace(/\s+/g, '')
+  
+  // 1. 카페 및 디저트류 (제과, 베이커리, 전통찻집, 빙수 등 포함)
+  if (
+    cat.includes('카페') || cat.includes('제과') || cat.includes('디저트') || cat.includes('빵') || cat.includes('커피') || cat.includes('아이스크림') ||
+    title.includes('카페') || title.includes('빵') || title.includes('베이커리') || title.includes('제과') || title.includes('커피') || 
+    title.includes('설빙') || title.includes('다방') || title.includes('에스프레소') || title.includes('디저트') || title.includes('샌드위치')
+  ) {
+    return '카페'
+  }
+
+  // 2. 일식 (초밥, 우동, 소바, 이자카야, 라멘, 돈가스 등)
+  if (
+    cat.includes('일식') || cat.includes('초밥') || cat.includes('스시') || cat.includes('돈까스') || cat.includes('우동') || cat.includes('소바') ||
+    title.includes('스시') || title.includes('초밥') || title.includes('돈까스') || title.includes('돈가스') || title.includes('카츠') || 
+    title.includes('라멘') || title.includes('우동') || title.includes('소바') || title.includes('연어') || title.includes('참치') || 
+    title.includes('이자카야') || title.includes('텐동') || title.includes('규동') || title.includes('가츠')
+  ) {
+    return '일식'
+  }
+
+  // 3. 중식 (짜장, 짬뽕, 양꼬치, 마라탕, 딤섬 등)
+  if (
+    cat.includes('중식') || cat.includes('중화') || cat.includes('마라탕') || cat.includes('양꼬치') ||
+    title.includes('반점') || title.includes('중화') || title.includes('짜장') || title.includes('짬뽕') || 
+    title.includes('객주') || title.includes('마라') || title.includes('양꼬치') || title.includes('양갈비') || 
+    title.includes('딤섬') || title.includes('차이나') || title.includes('취홍') || title.includes('성경만두')
+  ) {
+    return '중식'
+  }
+
+  // 4. 양식 (파스타, 피자, 스테이크, 패밀리레스토랑, 햄버거, 펍 등)
+  if (
+    cat.includes('양식') || cat.includes('경양식') || cat.includes('패밀리레스토랑') || cat.includes('햄버거') || cat.includes('피자') || cat.includes('파스타') ||
+    title.includes('파스타') || title.includes('피자') || title.includes('스테이크') || title.includes('이탈리') || title.includes('키친') || 
+    title.includes('버거') || title.includes('레스토랑') || title.includes('바베큐') || title.includes('바비큐') || title.includes('다이닝') || 
+    title.includes('펍') || title.includes('비스트로') || title.includes('플레이트')
+  ) {
+    return '양식'
+  }
+
+  // 5. 한식 (찌개, 탕, 고기구이, 족발, 보쌈, 전, 닭갈비, 분식 등 광범위한 한식류 매칭)
+  if (
+    cat.includes('한식') || cat.includes('분식') || cat.includes('백반') || cat.includes('갈비') || cat.includes('삼겹살') || cat.includes('국밥') ||
+    title.includes('식당') || title.includes('국밥') || title.includes('집') || title.includes('가든') || title.includes('옥') || 
+    title.includes('가') || title.includes('관') || title.includes('분식') || title.includes('국수') || title.includes('칼국수') || 
+    title.includes('면옥') || title.includes('갈비') || title.includes('구이') || title.includes('삼겹살') || title.includes('숯불') || 
+    title.includes('고기') || title.includes('해장국') || title.includes('감자탕') || title.includes('찌개') || title.includes('매운탕') || 
+    title.includes('족발') || title.includes('보쌈') || title.includes('닭갈비') || title.includes('찜닭') || title.includes('백숙') || 
+    title.includes('삼계탕') || title.includes('추어탕') || title.includes('설렁탕') || title.includes('곰탕') || title.includes('밥상') || 
+    title.includes('쌈밥') || title.includes('보리밥') || title.includes('순대') || title.includes('떡볶이') || title.includes('오뎅') || 
+    title.includes('전') || title.includes('지지미') || title.includes('한우') || title.includes('구이') || title.includes('포차') ||
+    title.includes('낙지') || title.includes('쭈꾸미') || title.includes('아구찜') || title.includes('게장')
+  ) {
+    return '한식'
+  }
+
+  return '기타'
+}
+
+const selectedRestaurantImage = computed(() => {
+  if (!selectedRestaurant.value) return ''
+  return selectedRestaurant.value.firstimage || selectedRestaurant.value.firstimage2 || ''
+})
+
+const kakaoPlaceLink = computed(() => {
+  if (!selectedRestaurant.value) return ''
+  if (selectedRestaurant.value.mapx && selectedRestaurant.value.mapy) {
+    return `https://map.kakao.com/link/map/${encodeURIComponent(
+      selectedRestaurant.value.title
+    )},${selectedRestaurant.value.mapy},${selectedRestaurant.value.mapx}`
+  }
+  return `https://map.kakao.com/link/search/${encodeURIComponent(
+    selectedRestaurant.value.addr1 || selectedRestaurant.value.title
+  )}`
+})
 
 const initializePosts = () => {
   if (typeof window === 'undefined') {
@@ -190,6 +279,9 @@ onMounted(() => {
     script.onload = () => {
       window.kakao.maps.load(initKakaoMap)
     }
+    script.onerror = () => {
+      console.error('Kakao SDK 로드 실패', script.src)
+    }
     document.head.appendChild(script)
   }
 })
@@ -241,13 +333,31 @@ const visiblePosts = computed(() => {
   })
 })
 
+// 수정: 메인이 아닐 때 각 탭(자유주제, 가게리뷰, 북마크)의 글 개수 계산
+const currentBoardPostCount = computed(() => {
+  return visiblePosts.value.length
+})
+
 const filteredRestaurants = computed(() => {
   const keyword = restaurantSearch.value.trim().toLowerCase()
-  if (!keyword) return restaurantList.value
-  return restaurantList.value.filter((item) => {
-    const haystack = [item.title, item.addr1].filter(Boolean).join(' ').toLowerCase()
-    return haystack.includes(keyword)
-  })
+  let result = restaurantList.value
+
+  // 1. 검색어 필터링
+  if (keyword) {
+    result = result.filter((item) => {
+      const haystack = [item.title, item.addr1].filter(Boolean).join(' ').toLowerCase()
+      return haystack.includes(keyword)
+    })
+  }
+
+  // 2. 카테고리 필터링 (이제 '기타' 필터링도 정상 작동합니다.)
+  if (selectedCategory.value !== '전체') {
+    result = result.filter((item) => {
+      return getRestaurantType(item) === selectedCategory.value
+    })
+  }
+
+  return result
 })
 
 const selectedRestaurantReviews = computed(() => {
@@ -273,7 +383,115 @@ const openCompose = () => {
   isComposeOpen.value = true
 }
 
+const focusSearch = () => {
+  nextTick(() => {
+    if (searchInputRef.value) {
+      searchInputRef.value.focus()
+    }
+  })
+}
+
+const deletePost = (postId) => {
+  const targetPost = posts.value.find((p) => p.id === postId)
+  if (!targetPost) return
+
+  const savedPasswords = JSON.parse(localStorage.getItem(PASSWORD_KEY) || '{}')
+  const actualPassword = savedPasswords[postId] || targetPost.password
+
+  if (!actualPassword) {
+    if (confirm('비밀번호가 설정되지 않은 게시글입니다. 삭제하시겠습니까?')) {
+      posts.value = posts.value.filter((p) => p.id !== postId)
+    }
+    return
+  }
+
+  const inputPassword = prompt('게시글을 삭제하려면 비밀번호를 입력하세요.')
+  if (inputPassword === null) return
+
+  if (inputPassword === actualPassword) {
+    posts.value = posts.value.filter((p) => p.id !== postId)
+    delete savedPasswords[postId]
+    localStorage.setItem(PASSWORD_KEY, JSON.stringify(savedPasswords))
+    alert('삭제되었습니다.')
+  } else {
+    alert('비밀번호가 일치하지 않습니다.')
+  }
+}
+
+
+// 1. 비밀번호 검증 (prompt 대신 모달 UI를 사용해야 하지만, 
+// 현재 환경이 prompt를 막고 있다면 아래 로직도 작동하지 않습니다. 
+// 이 경우 prompt를 input 폼으로 대체해야 합니다.)
+const checkPermission = (postId) => {
+  const targetPost = posts.value.find((p) => p.id === postId);
+  if (!targetPost) return { result: false, type: 'notfound' };
+
+  const savedPasswords = JSON.parse(localStorage.getItem(PASSWORD_KEY) || '{}');
+  const actualPassword = savedPasswords[postId] || targetPost.password;
+
+  if (!actualPassword) {
+    return { result: confirm('비밀번호가 없는 글입니다. 진행하시겠습니까?'), type: 'no-password' };
+  }
+
+  // 만약 여기서 에러(prompt not supported)가 난다면, 
+  // 아래 prompt를 제거하고 모달창을 띄우는 방식으로 변경해야 합니다.
+  const inputPassword = prompt('비밀번호를 입력하세요.');
+  if (inputPassword === null) return { result: false, type: 'cancel' };
+  
+  return inputPassword === actualPassword 
+    ? { result: true, type: 'success' } 
+    : { result: false, type: 'wrong-password' };
+};
+
+// 2. 수정 함수 (postId 사용)
+const openEdit = (postId) => {
+  const post = posts.value.find((p) => p.id === postId);
+  if (!post) {
+    console.error("게시글을 찾을 수 없습니다:", postId);
+    return;
+  }
+
+  const status = checkPermission(postId);
+  
+  if (status.result) {
+    isEditMode.value = true;
+    editingPostId.value = postId;
+    
+    // form에 데이터 복사
+    form.value = { ...post }; 
+    
+    isComposeOpen.value = true;
+  } else if (status.type === 'wrong-password') {
+    alert('비밀번호가 일치하지 않습니다.');
+  }
+};
+
 const handleSubmit = () => {
+if (isEditMode.value) {
+    // 1. 수정할 포스트 찾기
+    const index = posts.value.findIndex(p => p.id === editingPostId.value);
+    if (index !== -1) {
+      // 2. 새로운 객체로 대체하여 반응성 유지
+      posts.value[index] = {
+        ...posts.value[index],
+        title: form.value.title,
+        content: form.value.content,
+        category: form.value.category,
+        restaurantName: form.value.restaurantName
+      };
+
+      // 3. 로컬 스토리지 업데이트
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(posts.value));
+    }
+
+    // 4. 상태 초기화
+    isEditMode.value = false;
+    editingPostId.value = null;
+    isComposeOpen.value = false;
+    resetForm();
+
+  return
+}
   if (!form.value.nickname || !form.value.title || !form.value.content) return
 
   const newPost = {
@@ -287,12 +505,16 @@ const handleSubmit = () => {
     createdAt: new Date().toISOString(),
   }
 
+  // 기존 배열 앞에 새 글 추가 후 반응성 갱신
   posts.value = [newPost, ...posts.value]
 
-  if (form.value.password) {
-    const existing = JSON.parse(localStorage.getItem(PASSWORD_KEY) || '{}')
-    existing[newPost.id] = form.value.password
-    localStorage.setItem(PASSWORD_KEY, JSON.stringify(existing))
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(posts.value))
+    if (form.value.password) {
+      const existing = JSON.parse(localStorage.getItem(PASSWORD_KEY) || '{}')
+      existing[newPost.id] = form.value.password
+      localStorage.setItem(PASSWORD_KEY, JSON.stringify(existing))
+    }
   }
 
   isComposeOpen.value = false
@@ -306,7 +528,7 @@ const selectRestaurant = (restaurant) => {
     const lng = Number(restaurant.mapx)
     if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
       const moveLatLon = new window.kakao.maps.LatLng(lat, lng)
-      mapInstance.value.setCenter(moveLatLon)
+      mapInstance.value.panTo(moveLatLon)
       mapInstance.value.setLevel(4)
     }
   }
@@ -334,7 +556,7 @@ const initKakaoMap = () => {
     })
 
     const infoWindow = new window.kakao.maps.InfoWindow({
-      content: `<div style="padding:6px 10px;font-size:13px;">${restaurant.title}</div>`,
+      content: `<div style="padding:8px 10px; font-size:13px;"><strong>${restaurant.title}</strong><br/>${restaurant.addr1}</div>`,
     })
 
     window.kakao.maps.event.addListener(marker, 'click', () => {
@@ -527,10 +749,10 @@ function onImgError(e, title) {
         </nav>
       </div>
 
-      <div class="hero-badges">
+      <div v-if="activeTab !== '메인'" class="hero-badges">
         <div class="badge-box">
-          <strong>총 게시글</strong>
-          <span>{{ posts.length }}</span>
+          <strong>{{ activeTab === '북마크' ? '북마크 개수' : `${currentBoardTitle} 게시글` }}</strong>
+          <span>{{ currentBoardPostCount }}</span>
         </div>
       </div>
     </header>
@@ -541,34 +763,71 @@ function onImgError(e, title) {
           <h2>식당 지도</h2>
           <div class="search-row">
             <input v-model="restaurantSearch" placeholder="식당 이름 또는 주소 검색" />
-            <button type="button" class="secondary" @click="restaurantSearch = ''">초기화</button>
+            <button type="button" class="primary search-btn">🔍</button>
           </div>
+        </div>
+
+        <!-- 업종별 카테고리 필터바 영역 -->
+        <div class="category-filter-bar">
+          <button
+            v-for="cat in categoryOptions"
+            :key="cat"
+            type="button"
+            class="filter-chip"
+            :class="{ active: selectedCategory === cat }"
+            @click="selectedCategory = cat"
+          >
+            {{ cat }}
+          </button>
         </div>
 
         <div id="kakao-map" class="kakao-map"></div>
         <div v-if="!mapReady && MAP_KEY" class="map-loading">지도를 불러오는 중입니다...</div>
         <div v-else-if="!MAP_KEY" class="map-loading">카카오맵 키를 설정하면 실제 지도가 표시됩니다.</div>
 
-        <div v-if="filteredRestaurants.length" class="restaurant-list">
-          <button
-            v-for="restaurant in filteredRestaurants"
-            :key="restaurant.title"
-            type="button"
-            class="restaurant-item"
-            @click="selectRestaurant(restaurant)"
-          >
-            {{ restaurant.title }}
-          </button>
+        <!-- 세로 1줄 목록 형태로 교체된 영역 -->
+        <div class="restaurant-list-container">
+          <div v-if="filteredRestaurants.length" class="restaurant-vertical-list">
+            <button
+              v-for="restaurant in filteredRestaurants"
+              :key="restaurant.title"
+              type="button"
+              class="restaurant-list-item"
+              :class="{ selected: selectedRestaurant && selectedRestaurant.title === restaurant.title }"
+              @click="selectRestaurant(restaurant)"
+            >
+              <div class="item-info">
+                <span class="item-category-tag">{{ getRestaurantType(restaurant) }}</span>
+                <strong class="item-title">{{ restaurant.title }}</strong>
+                <p class="item-addr">{{ restaurant.addr1 }}</p>
+              </div>
+            </button>
+          </div>
+          <div v-else class="empty-list-state">
+            선택한 카테고리나 검색어에 해당하는 식당이 없습니다.
+          </div>
         </div>
       </div>
 
       <div class="review-card">
-        <h2>선택한 가게 리뷰</h2>
+        <h2>선택한 가게 정보</h2>
+
         <div v-if="selectedRestaurant" class="selected-store">
           <strong>{{ selectedRestaurant.title }}</strong>
           <p>{{ selectedRestaurant.addr1 }}</p>
+
+          <div v-if="selectedRestaurantImage" class="store-image">
+            <img :src="selectedRestaurantImage" :alt="selectedRestaurant.title" />
+          </div>
+
+          <div class="kakao-place-info">
+            <a v-if="kakaoPlaceLink" :href="kakaoPlaceLink" target="_blank" rel="noreferrer">
+              카카오맵에서 위치 보기
+            </a>
+          </div>
         </div>
-        <div v-else class="empty-state">지도에서 가게를 선택하면 리뷰가 나타납니다.</div>
+
+        <div v-else class="empty-state">지도에서 가게를 선택하면 장소 정보가 나타납니다.</div>
 
         <div v-for="review in selectedRestaurantReviews" :key="review.id" class="review-item">
           <div class="review-header">
@@ -576,6 +835,7 @@ function onImgError(e, title) {
             <span>{{ review.nickname }}</span>
           </div>
           <p>{{ review.content }}</p>
+          <button type="button" class="delete-btn" @click="deletePost(review.id)">삭제</button>
         </div>
       </div>
     </section>
@@ -585,14 +845,18 @@ function onImgError(e, title) {
         <div>
           <h2>{{ currentBoardTitle }}</h2>
           <p class="sub-copy">
-            {{ activeTab === '자유주제' ? '자유롭게 이야기하는 공간입니다.' : activeTab === '가게리뷰' ? '가게 후기를 남기는 공간입니다.' : '북마크한 글만 모아봅니다.' }}
+            {{ activeTab === '자유주제'
+              ? '자유롭게 이야기하는 공간입니다.'
+              : activeTab === '가게리뷰'
+              ? '가게 후기를 남기는 공간입니다.'
+              : '북마크한 글만 모아봅니다.' }}
           </p>
         </div>
 
         <div class="board-tools">
-          <input v-model="searchKeyword" :placeholder="`${currentBoardTitle} 검색`" />
-          <button type="button" class="primary" @click="openCompose">글쓰기</button>
-        </div>
+          <input ref="searchInputRef" v-model="searchKeyword" :placeholder="`${currentBoardTitle} 검색`" />
+          <button type="button" class="primary" @click="focusSearch">🔍</button>
+          </div>
       </div>
 
       <div class="post-list">
@@ -605,14 +869,20 @@ function onImgError(e, title) {
           <p>{{ post.content }}</p>
           <div v-if="post.restaurantName" class="restaurant-link">{{ post.restaurantName }}</div>
 
-          <button type="button" class="bookmark-btn" @click="toggleBookmark(post.id)">
-            {{ bookmarkedPostIds.includes(post.id) ? '★' : '☆' }}
-          </button>
+          <div class="post-actions">
+            <div style="display: flex; gap: 8px;">
+            <button @click="openEdit(post.id)" style="width: 60px; height: 30px; display: flex; align-items: center; justify-content: center;">수정</button>
+            <button @click="deletePost(post.id)" style="width: 60px; height: 30px; display: flex; align-items: center; justify-content: center;">삭제</button>
+            </div>
+            <button type="button" class="bookmark-btn" @click="toggleBookmark(post.id)">
+              {{ bookmarkedPostIds.includes(post.id) ? '★' : '☆' }}
+            </button>
+          </div>
         </article>
       </div>
     </section>
 
-    <button v-if="activeTab !== '메인'" type="button" class="floating-write" @click="openCompose">✎</button>
+    <button v-if="activeTab !== '메인' && activeTab !== '북마크'" type="button" class="floating-write" @click="openCompose">✎</button>
 
     <div v-if="isComposeOpen" class="modal-backdrop" @click.self="isComposeOpen = false">
       <div class="modal-card">
@@ -633,10 +903,9 @@ function onImgError(e, title) {
           </div>
 
           <textarea v-model="form.content" required placeholder="내용을 입력하세요"></textarea>
-          <input v-model="form.restaurantName" placeholder="가게 이름(가게리뷰일 때 입력 가능)" />
-
+          <input v-if="form.category === '가게리뷰'" v-model="form.restaurantName" placeholder="가게 이름" />
           <div class="modal-actions">
-            <button type="submit" class="primary">등록</button>
+            <button type="submit" class="primary">{{ isEditMode ? '수정' : '등록' }}</button>
           </div>
         </form>
       </div>
@@ -688,17 +957,18 @@ function onImgError(e, title) {
 </template>
 
 <style scoped>
+/* 토스 UI 느낌으로 부드러운 여백, 모서리(Radius), 그림자 다듬기 */
 :global(body) {
   margin: 0;
-  background: #f4f7fb;
-  font-family: 'Pretendard', 'Segoe UI', sans-serif;
+  background: #f4f6f8;
+  font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif;
 }
 
 .app-shell {
   max-width: 1400px;
   margin: 0 auto;
   padding: 24px;
-  color: #1f2937;
+  color: #191f28;
 }
 
 .hero {
@@ -706,48 +976,50 @@ function onImgError(e, title) {
   justify-content: space-between;
   gap: 16px;
   align-items: center;
-  padding: 20px 24px;
+  padding: 20px 28px;
   border-radius: 24px;
-  background: linear-gradient(135deg, #eff6ff, #fef3c7);
-  margin-bottom: 20px;
+  background: white;
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.03);
+  margin-bottom: 24px;
 }
 
 .hero-left {
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 24px;
 }
 
 .brand {
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 800;
-  color: #111827;
+  color: #3182f6;
 }
 
 .nav-menu {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
 }
 
 .nav-item {
   background: transparent;
-  color: #6b7280;
+  color: #6b7684;
   border: none;
-  padding: 8px 10px;
-  border-radius: 999px;
+  padding: 10px 16px;
+  border-radius: 14px;
   font-weight: 600;
+  font-size: 15px;
   transition: all 0.2s ease;
 }
 
 .nav-item:hover {
-  color: #111827;
-  background: #f3f4f6;
+  color: #191f28;
+  background: #f2f4f6;
 }
 
 .nav-item.active {
   color: white;
-  background: #111827;
+  background: #3182f6;
 }
 
 .hero-badges {
@@ -756,29 +1028,31 @@ function onImgError(e, title) {
 }
 
 .badge-box {
-  min-width: 120px;
-  padding: 12px 14px;
-  border-radius: 14px;
-  background: white;
-  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.06);
+  min-width: 110px;
+  padding: 12px 16px;
+  border-radius: 16px;
+  background: #f9fbfd;
+  border: 1px solid #e5e8eb;
 }
 
 .badge-box strong {
   display: block;
-  font-size: 11px;
-  color: #6b7280;
+  font-size: 12px;
+  color: #6b7684;
+  margin-bottom: 4px;
 }
 
 .badge-box span {
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 700;
+  color: #3182f6;
 }
 
 .main-view {
   display: grid;
   grid-template-columns: 1.6fr 1fr;
-  gap: 20px;
-  margin-bottom: 20px;
+  gap: 24px;
+  margin-bottom: 24px;
 }
 
 .map-card,
@@ -787,13 +1061,14 @@ function onImgError(e, title) {
 .modal-card,
 .chat-float {
   background: white;
-  border-radius: 20px;
-  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+  border-radius: 24px;
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.02);
 }
 
 .map-card,
 .review-card {
-  padding: 16px;
+  padding: 24px;
 }
 
 .card-title-row,
@@ -804,7 +1079,7 @@ function onImgError(e, title) {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 
 .board-header {
@@ -813,7 +1088,8 @@ function onImgError(e, title) {
 
 .sub-copy {
   margin: 6px 0 0;
-  color: #6b7280;
+  color: #6b7684;
+  font-size: 14px;
 }
 
 .search-row,
@@ -823,57 +1099,144 @@ function onImgError(e, title) {
   align-items: center;
 }
 
-  .search-row input,
-  .board-tools input,
-  .modal-card input,
-  .modal-card textarea,
-  .modal-card select,
-  .chat-input-row input {
-    width: 100%;
-    border: 1px solid #d1d5db;
-    border-radius: 10px;
-    padding: 10px 12px;
-    box-sizing: border-box;
-    flex: 1;
-  }
+.search-row input,
+.board-tools input,
+.modal-card input,
+.modal-card textarea,
+.modal-card select,
+.chat-input-row input {
+  width: 100%;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-sizing: border-box;
+}
 
 .kakao-map {
   width: 100%;
-  height: 360px;
-  border-radius: 14px;
-  background: #f8fafc;
-  border: 1px solid #e5e7eb;
+  height: 380px;
+  border-radius: 18px;
+  background: #f2f4f6;
+  border: none;
 }
 
 .map-loading {
   margin-top: 10px;
+  color: #6b7684;
+}
+
+/* 카테고리 필터 가로 바 */
+.category-filter-bar {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 4px 0 12px;
+  scrollbar-width: none;
+}
+.category-filter-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.filter-chip {
+  background: #f3f4f6;
+  color: #4b5563;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.filter-chip:hover {
+  background: #e5e7eb;
+  color: #1f2937;
+}
+
+.filter-chip.active {
+  background: #2563eb;
+  color: white;
+  border-color: #2563eb;
+}
+
+/* 세로 목록형 식당 리스트 스타일 */
+.restaurant-list-container {
+  margin-top: 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #f8fafc;
+  overflow: hidden;
+}
+
+.restaurant-vertical-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 280px; /* 세로 스크롤 범위 설정 */
+  overflow-y: auto;
+}
+
+.restaurant-list-item {
+  width: 100%;
+  text-align: left;
+  background: white;
+  border: none;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 12px 16px;
+  transition: background 0.2s ease;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+}
+
+.restaurant-list-item:last-child {
+  border-bottom: none;
+}
+
+.restaurant-list-item:hover {
+  background: #f1f5f9;
+}
+
+.restaurant-list-item.selected {
+  background: #eff6ff;
+  border-left: 4px solid #2563eb;
+  padding-left: 12px;
+}
+
+.item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.item-category-tag {
+  align-self: flex-start;
+  font-size: 10px;
+  font-weight: 700;
+  color: #2563eb;
+  background: #dbeafe;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.item-title {
+  font-size: 14px;
+  color: #1f2937;
+  font-weight: 700;
+}
+
+.item-addr {
+  margin: 0;
+  font-size: 12px;
   color: #6b7280;
 }
 
-.restaurant-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.restaurant-item {
-  background: #f3f4f6;
-  color: #374151;
-  border-radius: 999px;
-  padding: 8px 12px;
-}
-
-.review-item {
-  padding: 10px 0;
-  border-bottom: 1px solid #e5e7eb;
-}
-
-.review-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 4px;
+.empty-list-state {
+  padding: 24px;
+  text-align: center;
+  color: #9ca3af;
+  font-size: 13px;
+  background: white;
 }
 
 .selected-store {
@@ -883,77 +1246,161 @@ function onImgError(e, title) {
   background: #f8fafc;
 }
 
-.board-view {
+.store-image {
+  margin-top: 12px;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.store-image img {
+  width: 100%;
+  height: auto;
+  display: block;
+  object-fit: cover;
+}
+
+.kakao-place-info {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+}
+
+.kakao-place-info a {
+  display: inline-block;
+  margin-top: 8px;
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.review-item {
+  padding: 14px 0;
+  border-bottom: 1px solid #f2f4f6;
+  position: relative;
+}
+
+.review-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.selected-store {
+  margin-bottom: 16px;
   padding: 16px;
+  border-radius: 16px;
+  background: #f9fbfd;
+  border: 1px solid #e5e8eb;
+}
+.board-view {
+  padding: 24px;
 }
 
 .post-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin-top: 14px;
+  gap: 12px;
+  margin-top: 16px;
 }
 
 .post-card {
-  padding: 14px;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
+  padding: 20px;
+  border: 1px solid #e5e8eb;
+  border-radius: 20px;
   position: relative;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.post-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.04);
 }
 
 .post-meta {
   display: flex;
   gap: 8px;
   align-items: center;
-  color: #6b7280;
+  color: #6b7684;
   font-size: 13px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 
 .pill {
   display: inline-block;
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: #e0f2fe;
-  color: #0369a1;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: #e8f3ff;
+  color: #1b64da;
+  font-weight: 600;
+  font-size: 12px;
 }
 
 .restaurant-link {
-  margin-top: 8px;
-  color: #2563eb;
+  margin-top: 10px;
+  color: #3182f6;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.post-actions {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.delete-btn {
+  background: #f2f4f6;
+  color: #f04452;
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 8px;
   font-weight: 600;
 }
 
+.delete-btn:hover {
+  background: #feebee;
+}
+
 .bookmark-btn {
-  position: absolute;
-  top: 14px;
-  right: 14px;
   border: none;
   background: transparent;
-  font-size: 18px;
-  color: #f59e0b;
+  font-size: 20px;
+  color: #ffc107;
   cursor: pointer;
+  padding: 0;
 }
 
 .floating-write {
   position: fixed;
-  right: 24px;
-  bottom: 92px;
-  width: 56px;
-  height: 56px;
+  right: 28px;
+  bottom: 96px;
+  width: 58px;
+  height: 58px;
   border-radius: 50%;
   border: none;
-  background: #2563eb;
+  background: #3182f6;
   color: white;
-  font-size: 24px;
+  font-size: 26px;
   cursor: pointer;
-  box-shadow: 0 10px 20px rgba(37, 99, 235, 0.3);
+  box-shadow: 0 8px 20px rgba(49, 130, 246, 0.3);
+  transition: transform 0.2s;
+}
+
+.floating-write:hover {
+  transform: scale(1.05);
 }
 
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.35);
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -963,79 +1410,91 @@ function onImgError(e, title) {
 
 .modal-card {
   width: min(560px, 100%);
-  padding: 18px;
+  padding: 24px;
 }
 
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
 }
 
 .modal-card textarea {
-  min-height: 110px;
-  margin-top: 10px;
+  min-height: 130px;
+  margin-top: 12px;
+  resize: vertical;
 }
 
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  margin-top: 10px;
+  margin-top: 16px;
 }
 
 button {
   border: none;
-  border-radius: 10px;
-  padding: 10px 12px;
+  border-radius: 12px;
+  padding: 10px 16px;
   cursor: pointer;
   font-weight: 600;
+  font-size: 14px;
+  transition: background 0.2s;
 }
 
 button.primary {
-  background: #2563eb;
+  background: #3182f6;
   color: white;
 }
 
+button.primary:hover {
+  background: #1b64da;
+}
+
 button.secondary {
-  background: #e5e7eb;
-  color: #374151;
+  background: #f2f4f6;
+  color: #4e5968;
+}
+
+button.secondary:hover {
+  background: #e5e8eb;
 }
 
 .chat-toggle {
   position: fixed;
-  right: 20px;
-  bottom: 20px;
-  width: 54px;
-  height: 54px;
+  right: 28px;
+  bottom: 24px;
+  width: 56px;
+  height: 56px;
   border-radius: 50%;
   border: none;
-  background: #111827;
+  background: #191f28;
   color: white;
   font-size: 22px;
   cursor: pointer;
-  box-shadow: 0 10px 20px rgba(17, 24, 39, 0.25);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
   z-index: 90;
 }
 
 .chat-float {
   position: fixed;
-  right: 20px;
-  bottom: 86px;
+  right: 28px;
+  bottom: 90px;
   width: min(360px, calc(100vw - 32px));
-  padding: 14px;
+  padding: 20px;
   z-index: 80;
   background: white;
-  border-radius: 16px;
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
+  border-radius: 24px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.1);
+  border: 1px solid rgba(0, 0, 0, 0.05);
 }
 
 .chat-log {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 380px;
+  max-height: 220px;
   overflow-y: auto;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
 }
 
 .search-results {
@@ -1059,24 +1518,27 @@ button.secondary {
 .chat-float { max-height: 70vh }
 
 .message {
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: #f8fafc;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: #f2f4f6;
+  font-size: 14px;
 }
 
 .message.bot {
-  background: #eff6ff;
+  background: #e8f3ff;
+  color: #1b64da;
 }
 
 .message strong {
   display: block;
   margin-bottom: 4px;
+  font-size: 12px;
 }
 
 .chat-input-row {
   display: flex;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .chat-input-row input:focus {
@@ -1088,13 +1550,14 @@ button.secondary {
 .chat-close {
   background: transparent;
   padding: 0;
-  font-size: 18px;
-  color: #666;
+  font-size: 20px;
+  color: #8b95a1;
 }
 
 .empty-state {
-  color: #6b7280;
-  padding: 10px 0;
+  color: #8b95a1;
+  padding: 20px 0;
+  text-align: center;
 }
 
 @media (max-width: 900px) {
