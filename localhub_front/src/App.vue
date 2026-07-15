@@ -24,12 +24,55 @@ const form = ref({
   restaurantName: '',
 })
 const chatInput = ref('')
+const skipTrivialOnce = ref(false)
 const chatMessages = ref([
   {
     role: 'bot',
-    text: '안녕하세요! 지역 커뮤니티 챗봇입니다. 지도에서 식당을 클릭하거나 게시글 카테고리를 바꿔보세요.',
+    text: '안녕하세요. 저는 대전 지역 음식점 데이터만 참조해 답변하는 챗봇입니다. 업소명/주소/우편번호/카테고리로 질문해주세요.',
   },
 ])
+
+// Build follow-up options from local JSON when LLM fails to provide candidates
+function buildFollowups(userQuery) {
+  const lower = (userQuery || '').toLowerCase()
+
+  // define larger groups and synonyms for naturalization
+  const groups = [
+    { key: '한식', label: '한식', syns: ['한식', '백반', '한정식', '한식당'] },
+    { key: '양식/중식', label: '양식/중식', syns: ['양식', '파스타', '스테이크', '이탈리안', '중식', '짜장', '짬뽕'] },
+    { key: '카페/디저트', label: '카페/디저트', syns: ['카페', '커피', '디저트', '베이커리'] },
+    { key: '고기/구이', label: '고기/구이', syns: ['고기', '구이', '삼겹살', '갈비', '육류'] },
+    { key: '국밥', label: '국밥', syns: ['국밥', '설렁탕', '곰탕'] },
+    { key: '비빔밥', label: '비빔밥', syns: ['비빔밥'] },
+    { key: '면', label: '면/국수', syns: ['면', '국수', '칼국수', '우동', '라면'] },
+  ]
+
+  const options = []
+
+  // include groups that have matching restaurants
+  for (const g of groups) {
+    const exists = restaurantsData.items.some((r) => {
+      const title = (r.title || '').toLowerCase()
+      return g.syns.some((s) => title.includes(s))
+    })
+    if (exists) options.push({ label: `${g.label} 추천`, query: g.key })
+  }
+
+  // If user's query contains a synonym, prioritize that group
+  for (const g of groups) {
+    if (g.syns.some((s) => lower.includes(s))) {
+      const idx = options.findIndex((o) => o.query === g.key)
+      if (idx > 0) {
+        const [it] = options.splice(idx, 1)
+        options.unshift(it)
+      }
+      break
+    }
+  }
+
+  return options
+}
+// searchResults is no longer used globally; candidates are rendered inline in chatMessages
 const mapInstance = ref(null)
 const mapReady = ref(false)
 const restaurantList = ref(restaurantsData.items.slice(0, 40))
@@ -309,24 +352,159 @@ const toggleBookmark = (postId) => {
   }
 }
 
-const sendChatMessage = () => {
+const sendChatMessage = async () => {
   const text = chatInput.value.trim()
   if (!text) return
 
   chatMessages.value.push({ role: 'user', text })
-  const lower = text.toLowerCase()
-
-  let reply = '원하는 카테고리와 식당을 선택하면 더 정확하게 도와드릴게요.'
-  if (lower.includes('자유') || lower.includes('게시판')) {
-    reply = '자유주제 탭에서는 일상, 동네 정보, 추천을 남길 수 있어요.'
-  } else if (lower.includes('리뷰') || lower.includes('식당')) {
-    reply = '가게리뷰 탭에서는 특정 식당에 대한 후기를 남기고 확인할 수 있어요.'
-  } else if (lower.includes('검색')) {
-    reply = '지도 상단 검색창으로 식당 이름을 먼저 찾아보세요.'
-  }
-
-  chatMessages.value.push({ role: 'bot', text: reply })
   chatInput.value = ''
+
+  try {
+    const resp = await fetch('http://localhost:3000/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    })
+    const json = await resp.json()
+    let reply = json?.reply || '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.'
+    // 특정 내부 폴백 안내 문구는 사용자에게 노출하지 않음
+    if (reply && reply.includes('모델 접근 권한')) {
+      reply = '요청하신 기준으로 몇 곳 추천드릴게요.'
+    }
+
+    // If server gives a generic '요청하신 기준으로 몇 곳 추천드릴게요.', do NOT display it.
+    // - If candidates exist, we'll render them below without showing this generic text.
+    // - If no candidates, show a category selection prompt instead.
+    const NEED_CATEGORY_MSG = '요청하신 기준으로 몇 곳 추천드릴게요.'
+    if (reply === NEED_CATEGORY_MSG) {
+      if (!json?.candidates || json.candidates.length === 0) {
+        const followups = buildFollowups(text)
+        chatMessages.value.push({ role: 'bot', text: '카테고리를 선택해 주세요. 아래에서 골라주세요.', followups })
+      }
+      // otherwise: skip pushing the generic reply entirely
+    } else {
+      if (reply) chatMessages.value.push({ role: 'bot', text: reply })
+    }
+
+    // Trivial input detection (greetings, very short non-intent)
+    const isTrivialQuery = (s) => {
+      if (!s) return true
+      const low = s.toLowerCase()
+      const greetings = ['안녕', '안녕하세요', '하이', 'hi', 'hello', '반가워', '반갑']
+      if (greetings.some((g) => low.includes(g))) return true
+      // very short queries (1-2 characters) likely non-intent
+      if (low.replace(/\s+/g, '').length <= 2) return true
+      return false
+    }
+
+    // candidates가 있으면 그것을 enrich(이미지 조회 등)한 후 채팅 메시지로 추가
+    let candidates = json?.candidates || []
+    const trivial = isTrivialQuery(text) && !skipTrivialOnce.value
+    // reset the skip flag after using it
+    if (skipTrivialOnce.value) skipTrivialOnce.value = false
+    const kakaoKey = import.meta.env.VITE_KAKAO_REST_KEY || ''
+    if (candidates.length) {
+      for (const item of candidates) {
+        if (!item.firstimage && item.title) {
+          try {
+            // 1) try kakao if key provided
+            let gotImage = false
+            if (kakaoKey) {
+              try {
+                const q = encodeURIComponent(item.title + ' ' + (item.addr1 || ''))
+                const r = await fetch(`https://dapi.kakao.com/v2/local/search/keyword.json?query=${q}`, {
+                  headers: { Authorization: `KakaoAK ${kakaoKey}` },
+                })
+                if (r.ok) {
+                  const d = await r.json()
+                  const place = d?.documents?.[0]
+                  if (place && place.place_name) {
+                    item.firstimage = place?.place_url || item.firstimage || ''
+                    item.place_url = place?.place_url || item.place_url || ''
+                    item.mapx = item.mapx || place?.x || item.mapx
+                    item.mapy = item.mapy || place?.y || item.mapy
+                    gotImage = !!item.firstimage
+                  }
+                }
+              } catch (er) {
+                console.warn('Kakao image fetch failed', er)
+              }
+            }
+            // 2) if still no image, fallback to Unsplash (guarantees an image)
+            if (!item.firstimage) {
+              const imgUrl = `https://source.unsplash.com/featured/?${encodeURIComponent(item.title + ' restaurant')}`
+              item.firstimage = imgUrl
+            }
+            
+          } catch (er) {
+            console.warn('Kakao image fetch failed', er)
+          }
+        }
+      }
+    }
+
+    if (trivial) {
+      // For trivial inputs, prioritize showing follow-up options instead of candidates
+      const followups = buildFollowups(text)
+      chatMessages.value.push({ role: 'bot', followups })
+    } else {
+      if (candidates.length) {
+        chatMessages.value.push({ role: 'bot', candidates })
+      } else {
+        // no candidates -> provide follow-up options derived from local JSON
+        const followups = buildFollowups(text)
+        chatMessages.value.push({ role: 'bot', text: reply, followups })
+      }
+    }
+  } catch (err) {
+    console.error(err)
+    chatMessages.value.push({ role: 'bot', text: '서버에 연결할 수 없습니다.' })
+  }
+}
+
+function handleFollowupClick(query) {
+  // set the query and force one search even if query looks trivial
+  skipTrivialOnce.value = true
+  chatInput.value = query
+  // small delay to allow UI update then send
+  setTimeout(() => sendChatMessage(), 50)
+}
+
+function makeKakaoLink(item) {
+  const lat = item.mapy || ''
+  const lng = item.mapx || ''
+  const title = item.title || ''
+  if (lat && lng) return `https://map.kakao.com/link/map/${encodeURIComponent(title)},${lat},${lng}`
+  return '#'
+}
+
+function onCandidateWheel(e) {
+  // Convert vertical wheel to horizontal scroll for candidate rows
+  try {
+    e.preventDefault()
+    const row = e.currentTarget
+    const children = row.querySelectorAll('.candidate-card')
+    if (!children || children.length === 0) return
+    const card = children[0]
+    const gap = parseFloat(getComputedStyle(row).gap) || 12
+    const step = Math.round(card.getBoundingClientRect().width + gap)
+    // current index
+    let index = Math.round(row.scrollLeft / step)
+    if (e.deltaY > 0) index = Math.min(index + 1, children.length - 1)
+    else index = Math.max(index - 1, 0)
+    row.scrollTo({ left: index * step, behavior: 'smooth' })
+  } catch (err) {
+    // ignore
+  }
+}
+
+function onImgError(e, title) {
+  try {
+    e.target.onerror = null
+    e.target.src = `https://source.unsplash.com/featured/?${encodeURIComponent(title + ' restaurant')}`
+  } catch (err) {
+    // ignore
+  }
 }
 </script>
 
@@ -477,7 +655,27 @@ const sendChatMessage = () => {
       <div class="chat-log">
         <div v-for="(message, index) in chatMessages" :key="index" class="message" :class="message.role">
           <strong>{{ message.role === 'user' ? '나' : '챗봇' }}</strong>
-          <p>{{ message.text }}</p>
+          <p v-if="message.text">{{ message.text }}</p>
+
+          <!-- candidates가 있는 bot 메시지는 카드형 가로 스크롤로 표시 -->
+              <div v-if="message.candidates && message.candidates.length" class="candidate-row" @wheel="onCandidateWheel">
+            <div v-for="(r, i) in message.candidates" :key="i" class="candidate-card">
+              <a :href="r.place_url || makeKakaoLink(r)" target="_blank" rel="noopener noreferrer">
+                <div class="thumb-small">
+                  <img v-if="r.firstimage" :src="r.firstimage" alt="img" loading="lazy" @error="onImgError($event, r.title)" />
+                  <div v-else class="noimg">이미지 없음</div>
+                </div>
+              </a>
+              <div class="meta-small">
+                <strong class="title"><a :href="r.place_url || makeKakaoLink(r)" target="_blank" rel="noopener noreferrer">{{ r.title }}</a></strong>
+                <div class="addr">{{ r.addr1 }} {{ r.addr2 || '' }}</div>
+              </div>
+            </div>
+          </div>
+          <!-- follow-up options when LLM couldn't return candidates -->
+          <div v-if="message.followups && message.followups.length" class="followup-row">
+            <button v-for="(f, fi) in message.followups" :key="fi" type="button" class="followup-btn" @click="handleFollowupClick(f.query)">{{ f.label }}</button>
+          </div>
         </div>
       </div>
 
@@ -625,18 +823,19 @@ const sendChatMessage = () => {
   align-items: center;
 }
 
-.search-row input,
-.board-tools input,
-.modal-card input,
-.modal-card textarea,
-.modal-card select,
-.chat-input-row input {
-  width: 100%;
-  border: 1px solid #d1d5db;
-  border-radius: 10px;
-  padding: 10px 12px;
-  box-sizing: border-box;
-}
+  .search-row input,
+  .board-tools input,
+  .modal-card input,
+  .modal-card textarea,
+  .modal-card select,
+  .chat-input-row input {
+    width: 100%;
+    border: 1px solid #d1d5db;
+    border-radius: 10px;
+    padding: 10px 12px;
+    box-sizing: border-box;
+    flex: 1;
+  }
 
 .kakao-map {
   width: 100%;
@@ -834,10 +1033,30 @@ button.secondary {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 220px;
+  max-height: 380px;
   overflow-y: auto;
   margin-bottom: 10px;
 }
+
+.search-results {
+  margin-top: 10px;
+}
+.candidate-row { display:flex; gap:12px; overflow-x:auto; padding:8px 0; scroll-behavior: smooth; scroll-snap-type: x mandatory }
+.candidate-card { min-width:240px; flex:0 0 auto; display:flex; gap:8px; padding:8px; border:1px solid #eee; border-radius:8px; align-items:center; background:#fff; scroll-snap-align: start }
+.candidate-card .thumb-small { width:96px; height:72px; background:#f3f4f6; display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:6px }
+.candidate-card .thumb-small img { width:100%; height:100%; object-fit:cover }
+.candidate-card .noimg { color:#6b7280; font-size:12px }
+.candidate-card .meta-small { flex:1 }
+.candidate-card .addr, .candidate-card .cat { font-size:12px; color:#6b7280 }
+.candidate-card .title { font-size:14px; display:block; margin-bottom:4px }
+
+/* Slim scrollbar for candidate row and chat log */
+.candidate-row::-webkit-scrollbar { height:8px }
+.candidate-row::-webkit-scrollbar-track { background: transparent }
+.candidate-row::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.18); border-radius: 8px }
+.chat-log::-webkit-scrollbar { width:8px }
+.chat-log::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 8px }
+.chat-float { max-height: 70vh }
 
 .message {
   padding: 10px 12px;
@@ -858,6 +1077,12 @@ button.secondary {
   display: flex;
   gap: 8px;
   margin-top: 8px;
+}
+
+.chat-input-row input:focus {
+  outline: none;
+  border-color: #000;
+  box-shadow: 0 0 0 2px rgba(0,0,0,0.06);
 }
 
 .chat-close {
