@@ -39,12 +39,96 @@ const mapInstance = ref(null)
 const mapReady = ref(false)
 const restaurantList = ref(restaurantsData.items.slice(0, 40))
 
+// --- 카테고리 필터 관련 상태 (선택 항목에 '기타' 추가) ---
+const selectedCategory = ref('전체')
+const categoryOptions = ['전체', '한식', '일식', '중식', '양식', '카페', '기타']
+
 const tabOptions = [
-  { value: '메인', label: '메인' },
-  { value: '자유주제', label: '자유주제' },
-  { value: '가게리뷰', label: '가게리뷰' },
-  { value: '북마크', label: '북마크' },
+  { label: '메인', value: '메인' },
+  { label: '자유주제', value: '자유주제' },
+  { label: '가게리뷰', value: '가게리뷰' },
+  { label: '북마크', value: '북마크' },
 ]
+
+// --- 강화된 카테고리 자동 판별 함수 ---
+const getRestaurantType = (restaurant) => {
+  const cat = (restaurant.category || '').replace(/\s+/g, '')
+  const title = (restaurant.title || '').replace(/\s+/g, '')
+  
+  // 1. 카페 및 디저트류 (제과, 베이커리, 전통찻집, 빙수 등 포함)
+  if (
+    cat.includes('카페') || cat.includes('제과') || cat.includes('디저트') || cat.includes('빵') || cat.includes('커피') || cat.includes('아이스크림') ||
+    title.includes('카페') || title.includes('빵') || title.includes('베이커리') || title.includes('제과') || title.includes('커피') || 
+    title.includes('설빙') || title.includes('다방') || title.includes('에스프레소') || title.includes('디저트') || title.includes('샌드위치')
+  ) {
+    return '카페'
+  }
+
+  // 2. 일식 (초밥, 우동, 소바, 이자카야, 라멘, 돈가스 등)
+  if (
+    cat.includes('일식') || cat.includes('초밥') || cat.includes('스시') || cat.includes('돈까스') || cat.includes('우동') || cat.includes('소바') ||
+    title.includes('스시') || title.includes('초밥') || title.includes('돈까스') || title.includes('돈가스') || title.includes('카츠') || 
+    title.includes('라멘') || title.includes('우동') || title.includes('소바') || title.includes('연어') || title.includes('참치') || 
+    title.includes('이자카야') || title.includes('텐동') || title.includes('규동') || title.includes('가츠')
+  ) {
+    return '일식'
+  }
+
+  // 3. 중식 (짜장, 짬뽕, 양꼬치, 마라탕, 딤섬 등)
+  if (
+    cat.includes('중식') || cat.includes('중화') || cat.includes('마라탕') || cat.includes('양꼬치') ||
+    title.includes('반점') || title.includes('중화') || title.includes('짜장') || title.includes('짬뽕') || 
+    title.includes('객주') || title.includes('마라') || title.includes('양꼬치') || title.includes('양갈비') || 
+    title.includes('딤섬') || title.includes('차이나') || title.includes('취홍') || title.includes('성경만두')
+  ) {
+    return '중식'
+  }
+
+  // 4. 양식 (파스타, 피자, 스테이크, 패밀리레스토랑, 햄버거, 펍 등)
+  if (
+    cat.includes('양식') || cat.includes('경양식') || cat.includes('패밀리레스토랑') || cat.includes('햄버거') || cat.includes('피자') || cat.includes('파스타') ||
+    title.includes('파스타') || title.includes('피자') || title.includes('스테이크') || title.includes('이탈리') || title.includes('키친') || 
+    title.includes('버거') || title.includes('레스토랑') || title.includes('바베큐') || title.includes('바비큐') || title.includes('다이닝') || 
+    title.includes('펍') || title.includes('비스트로') || title.includes('플레이트')
+  ) {
+    return '양식'
+  }
+
+  // 5. 한식 (찌개, 탕, 고기구이, 족발, 보쌈, 전, 닭갈비, 분식 등 광범위한 한식류 매칭)
+  if (
+    cat.includes('한식') || cat.includes('분식') || cat.includes('백반') || cat.includes('갈비') || cat.includes('삼겹살') || cat.includes('국밥') ||
+    title.includes('식당') || title.includes('국밥') || title.includes('집') || title.includes('가든') || title.includes('옥') || 
+    title.includes('가') || title.includes('관') || title.includes('분식') || title.includes('국수') || title.includes('칼국수') || 
+    title.includes('면옥') || title.includes('갈비') || title.includes('구이') || title.includes('삼겹살') || title.includes('숯불') || 
+    title.includes('고기') || title.includes('해장국') || title.includes('감자탕') || title.includes('찌개') || title.includes('매운탕') || 
+    title.includes('족발') || title.includes('보쌈') || title.includes('닭갈비') || title.includes('찜닭') || title.includes('백숙') || 
+    title.includes('삼계탕') || title.includes('추어탕') || title.includes('설렁탕') || title.includes('곰탕') || title.includes('밥상') || 
+    title.includes('쌈밥') || title.includes('보리밥') || title.includes('순대') || title.includes('떡볶이') || title.includes('오뎅') || 
+    title.includes('전') || title.includes('지지미') || title.includes('한우') || title.includes('구이') || title.includes('포차') ||
+    title.includes('낙지') || title.includes('쭈꾸미') || title.includes('아구찜') || title.includes('게장')
+  ) {
+    return '한식'
+  }
+
+  return '기타'
+}
+
+const selectedRestaurantImage = computed(() => {
+  if (!selectedRestaurant.value) return ''
+  return selectedRestaurant.value.firstimage || selectedRestaurant.value.firstimage2 || ''
+})
+
+const kakaoPlaceLink = computed(() => {
+  if (!selectedRestaurant.value) return ''
+  if (selectedRestaurant.value.mapx && selectedRestaurant.value.mapy) {
+    return `https://map.kakao.com/link/map/${encodeURIComponent(
+      selectedRestaurant.value.title
+    )},${selectedRestaurant.value.mapy},${selectedRestaurant.value.mapx}`
+  }
+  return `https://map.kakao.com/link/search/${encodeURIComponent(
+    selectedRestaurant.value.addr1 || selectedRestaurant.value.title
+  )}`
+})
 
 const initializePosts = () => {
   if (typeof window === 'undefined') {
@@ -152,6 +236,9 @@ onMounted(() => {
     script.onload = () => {
       window.kakao.maps.load(initKakaoMap)
     }
+    script.onerror = () => {
+      console.error('Kakao SDK 로드 실패', script.src)
+    }
     document.head.appendChild(script)
   }
 })
@@ -210,11 +297,24 @@ const currentBoardPostCount = computed(() => {
 
 const filteredRestaurants = computed(() => {
   const keyword = restaurantSearch.value.trim().toLowerCase()
-  if (!keyword) return restaurantList.value
-  return restaurantList.value.filter((item) => {
-    const haystack = [item.title, item.addr1].filter(Boolean).join(' ').toLowerCase()
-    return haystack.includes(keyword)
-  })
+  let result = restaurantList.value
+
+  // 1. 검색어 필터링
+  if (keyword) {
+    result = result.filter((item) => {
+      const haystack = [item.title, item.addr1].filter(Boolean).join(' ').toLowerCase()
+      return haystack.includes(keyword)
+    })
+  }
+
+  // 2. 카테고리 필터링 (이제 '기타' 필터링도 정상 작동합니다.)
+  if (selectedCategory.value !== '전체') {
+    result = result.filter((item) => {
+      return getRestaurantType(item) === selectedCategory.value
+    })
+  }
+
+  return result
 })
 
 const selectedRestaurantReviews = computed(() => {
@@ -385,7 +485,7 @@ const selectRestaurant = (restaurant) => {
     const lng = Number(restaurant.mapx)
     if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
       const moveLatLon = new window.kakao.maps.LatLng(lat, lng)
-      mapInstance.value.setCenter(moveLatLon)
+      mapInstance.value.panTo(moveLatLon)
       mapInstance.value.setLevel(4)
     }
   }
@@ -413,7 +513,7 @@ const initKakaoMap = () => {
     })
 
     const infoWindow = new window.kakao.maps.InfoWindow({
-      content: `<div style="padding:6px 10px;font-size:13px;">${restaurant.title}</div>`,
+      content: `<div style="padding:8px 10px; font-size:13px;"><strong>${restaurant.title}</strong><br/>${restaurant.addr1}</div>`,
     })
 
     window.kakao.maps.event.addListener(marker, 'click', () => {
@@ -489,30 +589,67 @@ const sendChatMessage = () => {
           </div>
         </div>
 
+        <!-- 업종별 카테고리 필터바 영역 -->
+        <div class="category-filter-bar">
+          <button
+            v-for="cat in categoryOptions"
+            :key="cat"
+            type="button"
+            class="filter-chip"
+            :class="{ active: selectedCategory === cat }"
+            @click="selectedCategory = cat"
+          >
+            {{ cat }}
+          </button>
+        </div>
+
         <div id="kakao-map" class="kakao-map"></div>
         <div v-if="!mapReady && MAP_KEY" class="map-loading">지도를 불러오는 중입니다...</div>
         <div v-else-if="!MAP_KEY" class="map-loading">카카오맵 키를 설정하면 실제 지도가 표시됩니다.</div>
 
-        <div v-if="filteredRestaurants.length" class="restaurant-list">
-          <button
-            v-for="restaurant in filteredRestaurants"
-            :key="restaurant.title"
-            type="button"
-            class="restaurant-item"
-            @click="selectRestaurant(restaurant)"
-          >
-            {{ restaurant.title }}
-          </button>
+        <!-- 세로 1줄 목록 형태로 교체된 영역 -->
+        <div class="restaurant-list-container">
+          <div v-if="filteredRestaurants.length" class="restaurant-vertical-list">
+            <button
+              v-for="restaurant in filteredRestaurants"
+              :key="restaurant.title"
+              type="button"
+              class="restaurant-list-item"
+              :class="{ selected: selectedRestaurant && selectedRestaurant.title === restaurant.title }"
+              @click="selectRestaurant(restaurant)"
+            >
+              <div class="item-info">
+                <span class="item-category-tag">{{ getRestaurantType(restaurant) }}</span>
+                <strong class="item-title">{{ restaurant.title }}</strong>
+                <p class="item-addr">{{ restaurant.addr1 }}</p>
+              </div>
+            </button>
+          </div>
+          <div v-else class="empty-list-state">
+            선택한 카테고리나 검색어에 해당하는 식당이 없습니다.
+          </div>
         </div>
       </div>
 
       <div class="review-card">
-        <h2>선택한 가게 리뷰</h2>
+        <h2>선택한 가게 정보</h2>
+
         <div v-if="selectedRestaurant" class="selected-store">
           <strong>{{ selectedRestaurant.title }}</strong>
           <p>{{ selectedRestaurant.addr1 }}</p>
+
+          <div v-if="selectedRestaurantImage" class="store-image">
+            <img :src="selectedRestaurantImage" :alt="selectedRestaurant.title" />
+          </div>
+
+          <div class="kakao-place-info">
+            <a v-if="kakaoPlaceLink" :href="kakaoPlaceLink" target="_blank" rel="noreferrer">
+              카카오맵에서 위치 보기
+            </a>
+          </div>
         </div>
-        <div v-else class="empty-state">지도에서 가게를 선택하면 리뷰가 나타납니다.</div>
+
+        <div v-else class="empty-state">지도에서 가게를 선택하면 장소 정보가 나타납니다.</div>
 
         <div v-for="review in selectedRestaurantReviews" :key="review.id" class="review-item">
           <div class="review-header">
@@ -530,7 +667,11 @@ const sendChatMessage = () => {
         <div>
           <h2>{{ currentBoardTitle }}</h2>
           <p class="sub-copy">
-            {{ activeTab === '자유주제' ? '자유롭게 이야기하는 공간입니다.' : activeTab === '가게리뷰' ? '가게 후기를 남기는 공간입니다.' : '북마크한 글만 모아봅니다.' }}
+            {{ activeTab === '자유주제'
+              ? '자유롭게 이야기하는 공간입니다.'
+              : activeTab === '가게리뷰'
+              ? '가게 후기를 남기는 공간입니다.'
+              : '북마크한 글만 모아봅니다.' }}
           </p>
         </div>
 
@@ -796,24 +937,154 @@ const sendChatMessage = () => {
   color: #6b7684;
 }
 
-.restaurant-list {
+/* 카테고리 필터 가로 바 */
+.category-filter-bar {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 16px;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 4px 0 12px;
+  scrollbar-width: none;
+}
+.category-filter-bar::-webkit-scrollbar {
+  display: none;
 }
 
-.restaurant-item {
-  background: #f2f4f6;
-  color: #333d4b;
-  border-radius: 12px;
-  padding: 8px 14px;
+.filter-chip {
+  background: #f3f4f6;
+  color: #4b5563;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 6px 14px;
   font-size: 13px;
-  transition: background 0.2s;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: all 0.2s ease;
 }
 
-.restaurant-item:hover {
-  background: #e5e8eb;
+.filter-chip:hover {
+  background: #e5e7eb;
+  color: #1f2937;
+}
+
+.filter-chip.active {
+  background: #2563eb;
+  color: white;
+  border-color: #2563eb;
+}
+
+/* 세로 목록형 식당 리스트 스타일 */
+.restaurant-list-container {
+  margin-top: 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #f8fafc;
+  overflow: hidden;
+}
+
+.restaurant-vertical-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 280px; /* 세로 스크롤 범위 설정 */
+  overflow-y: auto;
+}
+
+.restaurant-list-item {
+  width: 100%;
+  text-align: left;
+  background: white;
+  border: none;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 12px 16px;
+  transition: background 0.2s ease;
+  border-radius: 0;
+  display: flex;
+  align-items: center;
+}
+
+.restaurant-list-item:last-child {
+  border-bottom: none;
+}
+
+.restaurant-list-item:hover {
+  background: #f1f5f9;
+}
+
+.restaurant-list-item.selected {
+  background: #eff6ff;
+  border-left: 4px solid #2563eb;
+  padding-left: 12px;
+}
+
+.item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.item-category-tag {
+  align-self: flex-start;
+  font-size: 10px;
+  font-weight: 700;
+  color: #2563eb;
+  background: #dbeafe;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.item-title {
+  font-size: 14px;
+  color: #1f2937;
+  font-weight: 700;
+}
+
+.item-addr {
+  margin: 0;
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.empty-list-state {
+  padding: 24px;
+  text-align: center;
+  color: #9ca3af;
+  font-size: 13px;
+  background: white;
+}
+
+.selected-store {
+  margin-bottom: 12px;
+  padding: 10px;
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.store-image {
+  margin-top: 12px;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.store-image img {
+  width: 100%;
+  height: auto;
+  display: block;
+  object-fit: cover;
+}
+
+.kakao-place-info {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+}
+
+.kakao-place-info a {
+  display: inline-block;
+  margin-top: 8px;
+  color: #2563eb;
+  text-decoration: none;
 }
 
 .review-item {
@@ -836,7 +1107,6 @@ const sendChatMessage = () => {
   background: #f9fbfd;
   border: 1px solid #e5e8eb;
 }
-
 .board-view {
   padding: 24px;
 }
