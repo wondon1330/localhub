@@ -40,6 +40,17 @@ const form = ref({
   content: '',
   category: '자유주제',
   restaurantName: '',
+  rating: 5,
+})
+
+const restaurantSuggestions = computed(() => {
+  const keyword = form.value.restaurantName.trim()
+  if (!keyword) return []
+  return restaurantList.value
+    .filter(r => (r.title || '').includes(keyword))
+    .map(r => r.title)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .slice(0, 5)
 })
 const chatInput = ref('')
 const skipTrivialOnce = ref(false)
@@ -403,6 +414,12 @@ const selectedRestaurantReviews = computed(() => {
   })
 })
 
+const selectedRestaurantAverage = computed(() => {
+  if (!selectedRestaurantReviews.value.length) return '0.0'
+  const sum = selectedRestaurantReviews.value.reduce((total, r) => total + Number(r.rating || 0), 0)
+  return (sum / selectedRestaurantReviews.value.length).toFixed(1)
+})
+
 const resetForm = () => {
   form.value = {
     nickname: '',
@@ -411,6 +428,7 @@ const resetForm = () => {
     content: '',
     category: activeTab.value === '가게리뷰' ? '가게리뷰' : '자유주제',
     restaurantName: selectedRestaurant.value?.title || '',
+    rating: 5,
   }
 }
 
@@ -503,7 +521,7 @@ const openEdit = (postId) => {
 };
 
 const handleSubmit = () => {
-if (isEditMode.value) {
+  if (isEditMode.value) {
     // 1. 수정할 포스트 찾기
     const index = posts.value.findIndex(p => p.id === editingPostId.value);
     if (index !== -1) {
@@ -514,6 +532,8 @@ if (isEditMode.value) {
         content: form.value.content,
         category: form.value.category,
         restaurantName: form.value.restaurantName
+        ,
+        rating: Number(form.value.rating || 0)
       };
 
       // 3. 로컬 스토리지 업데이트
@@ -538,6 +558,7 @@ if (isEditMode.value) {
     title: form.value.title,
     content: form.value.content,
     restaurantName: form.value.restaurantName || '',
+    rating: Number(form.value.rating || 0),
     createdAt: new Date().toISOString(),
   }
 
@@ -1086,6 +1107,7 @@ function onImgError(e, title) {
         <div v-if="selectedRestaurant" class="selected-store">
           <strong>{{ selectedRestaurant.title }}</strong>
           <p>{{ selectedRestaurant.addr1 }}</p>
+          <div class="store-rating">⭐ 평균 별점 {{ selectedRestaurantAverage }} / 5.0</div>
 
           <div v-if="selectedRestaurantImage" class="store-image">
             <img :src="selectedRestaurantImage" :alt="selectedRestaurant.title" />
@@ -1138,7 +1160,10 @@ function onImgError(e, title) {
         <div v-for="review in selectedRestaurantReviews" :key="review.id" class="review-item">
           <div class="review-header">
             <strong>{{ review.title }}</strong>
-            <span>{{ review.nickname }}</span>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span>⭐ {{ Number(review.rating || 0).toFixed(1) }}</span>
+              <span>{{ review.nickname }}</span>
+            </div>
           </div>
           <p>{{ review.content }}</p>
           <button type="button" class="delete-btn" @click="deletePost(review.id)">삭제</button>
@@ -1170,6 +1195,7 @@ function onImgError(e, title) {
           <div class="post-meta">
             <span class="pill">{{ post.category }}</span>
             <span>{{ post.nickname }}</span>
+            <span v-if="post.category === '가게리뷰'" style="margin-left:8px;">⭐ {{ Number(post.rating || 0).toFixed(1) }}</span>
           </div>
           <h3>{{ post.title }}</h3>
           <p>{{ post.content }}</p>
@@ -1209,7 +1235,19 @@ function onImgError(e, title) {
           </div>
 
           <textarea v-model="form.content" required placeholder="내용을 입력하세요"></textarea>
-          <input v-if="form.category === '가게리뷰'" v-model="form.restaurantName" placeholder="가게 이름" />
+          <div v-if="form.category === '가게리뷰'">
+            <input v-model="form.restaurantName" placeholder="가게 이름" />
+            <div v-if="restaurantSuggestions.length" class="suggestion-box">
+              <div v-for="name in restaurantSuggestions" :key="name" class="suggestion-item" @click="form.restaurantName = name">{{ name }}</div>
+            </div>
+
+            <div class="rating-box">
+              <label>별점</label>
+              <input type="range" min="0.5" max="5" step="0.5" v-model.number="form.rating" />
+              <span>{{ Number(form.rating || 0).toFixed(1) }}점</span>
+            </div>
+          </div>
+
           <div class="modal-actions">
             <button type="submit" class="primary">{{ isEditMode ? '수정' : '등록' }}</button>
           </div>
