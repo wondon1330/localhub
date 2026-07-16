@@ -17,6 +17,12 @@ export default defineConfig({
         changeOrigin: true,
         secure: false,
       },
+      // Proxy Netlify functions to local Netlify dev (default port 8888)
+      '/.netlify/functions': {
+        target: 'http://localhost:8888',
+        changeOrigin: true,
+        secure: false,
+      },
     },
   },
   resolve: {
