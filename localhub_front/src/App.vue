@@ -2,7 +2,20 @@
 import { computed, onMounted, ref, watch, nextTick } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+const selectPopularRestaurant = (restaurant) => {
+  // 오른쪽 선택한 가게 정보 변경
+  selectRestaurant(restaurant)
 
+  // 지도 이동
+  if (mapInstance.value) {
+    const lat = Number(restaurant.mapy)
+    const lng = Number(restaurant.mapx)
+
+    if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
+      mapInstance.value.setView([lat, lng], 15)
+    }
+  }
+}
 // fix Leaflet default icon paths for Vite
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -135,7 +148,7 @@ const mapInstance = ref(null)
 const mapReady = ref(false)
 const markerGroup = ref(null)
 const showMarkers = ref(true) // markers shown by default
-const restaurantList = ref(restaurantsData.items.slice(0, 40))
+const restaurantList = ref(restaurantsData.items)
 
 // --- 카테고리 필터 관련 상태 (선택 항목에 '기타' 추가) ---
 const selectedCategory = ref('전체')
@@ -349,10 +362,17 @@ watch(
 )
 
 // render markers when map is ready
-watch(mapReady, () => {
-  if (mapReady.value) renderMarkers()
+watch([mapReady, restaurantList], () => {
+  if (mapReady.value) {
+    renderMarkers()
+  }
 })
 
+watch(restaurantList, () => {
+  if (mapReady.value) {
+    renderMarkers()
+  }
+})
 const currentBoardTitle = computed(() => {
   if (activeTab.value === '자유주제') return '자유주제'
   if (activeTab.value === '가게리뷰') return '가게리뷰'
@@ -593,27 +613,34 @@ const selectRestaurant = (restaurant) => {
   try { searchNaverBlogs() } catch (e) { console.warn('blog search failed', e) }
 }
 
+const createMasconDivIcon = (title) => {
+  const html = `
+    <div class="mascot-badge" title="${(title || '').replace(/"/g,'')}">
+      <img src="/assets/mascot.png" alt="m" />
+    </div>
+  `
+
+  return L.divIcon({
+    html,
+    className: 'mascot-div-icon',
+    iconSize: [24, 24],
+    iconAnchor: [12, 24],
+    popupAnchor: [0, -20]
+  })
+}
+
+
 const initLeafletMap = () => {
   const container = document.getElementById('kakao-map')
   if (!container) return
 
   mapInstance.value = L.map(container).setView([36.35, 127.38], 10)
+
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap contributors',
   }).addTo(mapInstance.value)
+
   mapReady.value = true
-
-  // create a badge-style DivIcon that contains the mascot image and gradient
-    const createMasconDivIcon = (title) => {
-    const html = `
-      <div class="mascot-badge" title="${(title||'').replace(/"/g,'')}">
-        <img src="/assets/mascot.png" alt="m" />
-      </div>`
-    // smaller icon for better map density
-    return L.divIcon({ html, className: 'mascot-div-icon', iconSize: [24, 24], iconAnchor: [12, 24], popupAnchor: [0, -20] })
-  }
-
-  // markers are rendered on demand via renderMarkers() to avoid cluttering map by default
 }
 
 async function searchNaverBlogs() {
@@ -690,32 +717,73 @@ async function batchAnalyzeAll() {
 }
 
 function renderMarkers() {
-  if (!mapInstance.value) return
-  // ensure markerGroup exists
-  if (!markerGroup.value) markerGroup.value = L.layerGroup()
+  console.log("renderMarkers 실행됨")
+  console.log("지도:", mapInstance.value)
+  console.log("데이터:", restaurantList.value)
+  console.log("showMarkers:", showMarkers.value)
 
-  // clear previous markers
-  markerGroup.value.clearLayers()
+  if (!mapInstance.value) return
+
+  // 마커 숨김 상태면 제거
+  if (!showMarkers.value) {
+    if (markerGroup.value) {
+      markerGroup.value.clearLayers()
+    }
+    return
+  }
+
+  // markerGroup 생성
+  if (!markerGroup.value) {
+    markerGroup.value = L.layerGroup()
+  }
+
+  // mascot 이미지 마커 아이콘
+  const markerIcon = L.icon({
+    iconUrl: '/assets/mascot.png',
+    iconSize: [40, 40],
+    iconAnchor: [20, 40],
+    popupAnchor: [0, -40]
+  })
 
   // add markers to group
   restaurantList.value.forEach((restaurant) => {
     const lat = Number(restaurant.mapy)
     const lng = Number(restaurant.mapx)
+
     if (Number.isNaN(lat) || Number.isNaN(lng)) return
-    const m = L.marker([lat, lng], { icon: createMasconDivIcon(restaurant.title) })
-    m.bindPopup(`<div style="padding:8px 10px; font-size:13px;"><strong>${restaurant.title}</strong><br/>${restaurant.addr1}</div>`)
+
+    const m = L.marker([lat, lng], {
+      icon: markerIcon
+    })
+
+    m.bindPopup(`
+      <div style="padding:8px 10px; font-size:13px;">
+        <strong>${restaurant.title}</strong><br/>
+        ${restaurant.addr1}
+      </div>
+    `)
+
     m.on('click', () => {
       selectRestaurant(restaurant)
       m.openPopup()
     })
+
     markerGroup.value.addLayer(m)
   })
 
-  // add group to map if not present
-  try { markerGroup.value.addTo(mapInstance.value) } catch (e) {}
+  // 지도에 마커 표시
+  try {
+    markerGroup.value.addTo(mapInstance.value)
+  } catch (e) {
+    console.log("마커 추가 오류:", e)
+  }
 }
 
 // toggleMarkers removed — markers are shown by default
+const toggleMarkers = () => {
+  showMarkers.value = !showMarkers.value
+  renderMarkers()
+}
 
 const toggleBookmark = (postId) => {
   if (bookmarkedPostIds.value.includes(postId)) {
@@ -1013,6 +1081,27 @@ function onImgError(e, title) {
 </script>
 
 <template>
+<div class="popular-sidebar">
+  <!-- 항상 보이는 아이콘 -->
+  <div class="popular-icon">
+    🔥
+  </div>
+
+  <!-- hover 시 나타나는 리스트 -->
+  <div class="popular-list">
+    <h3>이번 주 인기맛집</h3>
+
+    <div 
+      v-for="(restaurant, index) in popularRestaurants"
+      :key="restaurant.id"
+      class="popular-item"
+      @click="selectPopularRestaurant(restaurant)"
+    >
+      <span>{{ index + 1 }}</span>
+      {{ restaurant.title }}
+    </div>
+  </div>
+</div>
   <div class="app-shell">
     <header class="hero">
       <div class="hero-left">
@@ -1050,10 +1139,9 @@ function onImgError(e, title) {
             <div class="search-row">
               <input v-model="restaurantSearch" placeholder="식당 이름 또는 주소 검색" />
               <button type="button" class="primary search-btn">🔍</button>
-            </div>
-            <div style="display:flex; gap:6px; align-items:center;">
-              <input v-model="blogQuery" placeholder="네이버 블로그 검색" style="width:220px;" />
-              <button type="button" class="primary" @click="searchNaverBlogs">블로그 검색</button>
+              <button @click="toggleMarkers">
+                {{ showMarkers ? '마커 숨기기' : '마커 보기' }}
+              </button>
             </div>
           </div>
         </div>
@@ -1303,18 +1391,69 @@ function onImgError(e, title) {
 </template>
 
 <style scoped>
-/* 토스 UI 느낌으로 부드러운 여백, 모서리(Radius), 그림자 다듬기 */
 :global(body) {
   margin: 0;
-  background: #f4f6f8;
+  background: #FFF5F3;
   font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif;
 }
 
+.popular-sidebar {
+  position: absolute;
+  left: 20px;
+  top: 120px;
+  display: flex;
+  align-items: center;
+  z-index: 1000;
+}
+
+
+/* 항상 보이는 아이콘 */
+.popular-icon {
+  width: 50px;
+  height: 50px;
+  background: #e07a3b;
+  color: white;
+  border-radius: 50%;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  font-size: 24px;
+  cursor: pointer;
+}
+
+
+/* 기본은 숨김 */
+.popular-list {
+  width: 260px;
+  background: white;
+  margin-left: 10px;
+  padding: 15px;
+
+  border-radius: 15px;
+  box-shadow: 0 5px 20px rgba(0,0,0,0.15);
+
+  opacity: 0;
+  visibility: hidden;
+  transform: translateX(-20px);
+
+  transition: 0.3s;
+}
+
+
+/* 아이콘 위에 올리면 표시 */
+.popular-sidebar:hover .popular-list {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(0);
+}
 .app-shell {
   max-width: 1400px;
   margin: 0 auto;
   padding: 24px;
   color: #191f28;
+  
 }
 
 .hero {
@@ -1336,19 +1475,21 @@ function onImgError(e, title) {
 }
 
 .brand {
+  display: flex;
+  align-items: center;
   font-size: 26px;
   font-weight: 800;
   color: #e07a3b;
 }
+
 
 .brand-mascot {
   width: 44px;
   height: 44px;
   object-fit: contain;
   margin-right: 10px;
-  transform: translateY(4px);
+  transform: none;
 }
-
 /* mascot animations and badge */
 @keyframes bob {
   0% { transform: translateY(0); }
