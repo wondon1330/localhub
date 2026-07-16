@@ -13,7 +13,7 @@
       "dependencies": [
         "npm:@vitejs/plugin-vue@^6.0.7",
         "npm:leaflet@^1.9.4",
-        "npm:node-fetch@^3.4.1",
+        "npm:node-fetch@^3.3.1",
         "npm:vite-plugin-vue-devtools@^8.1.2",
         "npm:vite@^8.0.16",
         "npm:vue@^3.5.38"

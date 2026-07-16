@@ -25,11 +25,110 @@ L.Icon.Default.mergeOptions({
 })
 import restaurantsData from './data/대전_충청권_음식점.json'
 
+// Helper to create mascot div icon for Leaflet
+function createMasconDivIcon(title) {
+  const html = `
+    <div class="mascot-badge" title="${(title||'').replace(/"/g,'')}">
+      <img src="/assets/mascot.png" alt="m" />
+    </div>`
+  return L.divIcon({ html, className: 'mascot-div-icon', iconSize: [24, 24], iconAnchor: [12, 24], popupAnchor: [0, -20] })
+}
+
 const STORAGE_KEY = 'localhub-posts-v2'
 const PASSWORD_KEY = 'localhub-passwords-v2'
 const BOOKMARK_KEY = 'localhub-bookmarks-v1'
-const MAP_KEY = import.meta.env.VITE_KAKAO_MAP_KEY || ''
-const OPENAI_KEY = import.meta.env.VITE_OPENAI_API_KEY || ''
+const KAKAO_MAP_KEY = import.meta.env.VITE_KAKAO_MAP_KEY || ''
+const OPENAI_KEY = String(import.meta.env.VITE_OPENAI_API_KEY || '').trim().replace(/^['"]|['"]$/g, '')
+
+// Debug: do not log key value — only presence
+try { console.log('OPENAI_KEY present:', !!OPENAI_KEY) } catch (e) { }
+
+const improvedDetectionPrompt = `당신은 온라인 리뷰 텍스트의 작성자 진위를 판단하는 한국어 텍스트 분석 전문가입니다.
+
+판단 목적: 주어진 리뷰가 실제 사람이 방문하여 쓴 자연스러운 후기인지, 아니면 대량 생성(광고/AI)인지 0~100의 정수 확률로 판단하세요.
+
+판단 기준(예시):
+- 사람 작성: 구체적 경험·감정·장소·시간 언급, 자잘한 표현의 변형
+- 광고/AI: 지나치게 정돈된 문장, 키워드 반복, 설명형 문장
+
+명령(중요):
+1) 반드시 아래 정확한 JSON만 출력하세요. 다른 텍스트를 포함하지 마세요.
+2) "ai_writing_probability_percentage"는 0~100의 정수로 반환하세요.
+3) "reasons"는 판별 근거 1~3개를 배열로 제공하세요.
+4) "verdict"는 "사람 작성 의심" / "AI 작성 강력 의심" / "판단 보류" 중 하나로 하세요.
+
+예시 응답:
+{
+  "ai_writing_probability_percentage": 12,
+  "reasons": ["구체적 경험 묘사: 오후 2시 창가에서 먹은 음식의 질감 묘사"],
+  "verdict": "사람 작성 의심"
+}
+`
+
+// OpenAI call helper with model fallback
+async function callOpenAI(messages, opts = {}) {
+  const NETLIFY_BASE = import.meta.env.VITE_NETLIFY_FUNCTIONS_URL || ''
+  const endpoints = []
+  if (NETLIFY_BASE) endpoints.push(`${NETLIFY_BASE.replace(/\/$/, '')}/.netlify/functions/openaiProxy`)
+  endpoints.push('/.netlify/functions/openaiProxy')
+
+  for (const url of endpoints) {
+    try {
+      const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages, opts }) })
+      if (!resp.ok) {
+        const t = await resp.text().catch(() => '')
+        console.warn('callOpenAI endpoint failed', url, resp.status, t)
+        continue
+      }
+      const json = await resp.json()
+      return json
+    } catch (e) {
+      console.warn('callOpenAI fetch error', url, e?.message || e)
+      continue
+    }
+  }
+
+  if (OPENAI_KEY) {
+    console.warn('Falling back to direct OpenAI API from client (key exposed in browser).')
+    const fallbackModels = ['gpt-5-mini', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini', 'gpt-4o']
+    const modelsToTry = Array.isArray(opts.models) && opts.models.length ? opts.models : fallbackModels
+    for (const model of modelsToTry) {
+      try {
+        let payload = { model, messages, temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.2 }
+        if (model.includes('gpt-5') || model.includes('gpt-4.1') || model.includes('gpt-4o')) {
+          payload.max_completion_tokens = opts.max_tokens || 700
+        } else {
+          payload.max_tokens = opts.max_tokens || 700
+        }
+
+        let resp = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
+          body: JSON.stringify(payload),
+        })
+        let text = await resp.text()
+
+        if (!resp.ok) {
+          console.warn('Direct OpenAI returned', resp.status, text)
+          continue
+        }
+
+        try {
+          const data = JSON.parse(text)
+          return { model, data }
+        } catch (e) {
+          console.warn('Direct OpenAI parse error', e?.message || e)
+          continue
+        }
+      } catch (e) {
+        console.warn('Direct OpenAI fetch error', e?.message || e)
+        continue
+      }
+    }
+  }
+
+  return { model: 'local-fallback', data: { choices: [{ message: { content: '' } }] } }
+}
 
 const activeTab = ref('메인')
 const searchKeyword = ref('')
@@ -57,13 +156,18 @@ const form = ref({
 })
 
 const restaurantSuggestions = computed(() => {
-  const keyword = form.value.restaurantName.trim()
+  const keyword = (form.value.restaurantName || '').trim().toLowerCase()
   if (!keyword) return []
-  return restaurantList.value
-    .filter(r => (r.title || '').includes(keyword))
-    .map(r => r.title)
-    .filter((v, i, a) => a.indexOf(v) === i)
-    .slice(0, 5)
+  const matches = restaurantList.value
+    .map(r => ({ title: r.title || '', titleLower: (r.title || '').toLowerCase() }))
+    .filter(x => x.titleLower.includes(keyword))
+    .sort((a, b) => {
+      const aStarts = a.titleLower.startsWith(keyword) ? 0 : 1
+      const bStarts = b.titleLower.startsWith(keyword) ? 0 : 1
+      if (aStarts !== bStarts) return aStarts - bStarts
+      return a.title.localeCompare(b.title)
+    })
+  return matches.map(m => m.title).filter((v, i, a) => a.indexOf(v) === i).slice(0, 6)
 })
 const chatInput = ref('')
 const skipTrivialOnce = ref(false)
@@ -142,6 +246,22 @@ function retrieve(query, limit = 6) {
   }
 
   return []
+}
+
+function buildLocalRestaurantReply(query, hits) {
+  const q = (query || '').trim()
+  if (!hits || !hits.length) {
+    return '현재 데이터에서 관련 음식점을 찾지 못했습니다. 업소명이나 주소를 더 알려주세요.'
+  }
+
+  const top = hits.slice(0, 3)
+  const names = top.map((it) => `${it.title}${it.addr1 ? ` (${it.addr1})` : ''}`).join(' / ')
+  const first = top[0] || {}
+  const category = first.lclsSystm2 || first.lclsSystm3 || '음식점'
+  const base = /추천|맛집|어디|뭐|어떤/.test(q) ? `${first.title || '이곳'}을 먼저 참고해볼 수 있어요.` : `관련 데이터 기준으로 ${first.title || '해당 업소'}를 우선 확인해봤어요.`
+  const addrText = first.addr1 ? ` 주소는 ${first.addr1}입니다.` : ''
+  const telText = first.tel ? ` 연락처는 ${first.tel}입니다.` : ''
+  return `${base} 참고된 데이터 기준으로는 ${names}가 가장 적합합니다. 카테고리는 ${category}로 확인됐어요.${addrText}${telText}`.trim()
 }
 // searchResults is no longer used globally; candidates are rendered inline in chatMessages
 const mapInstance = ref(null)
@@ -434,6 +554,16 @@ const selectedRestaurantReviews = computed(() => {
   })
 })
 
+const sortOption = ref('최신')
+const sortedSelectedReviews = computed(() => {
+  const arr = [...selectedRestaurantReviews.value]
+  if (sortOption.value === '평점순') {
+    return arr.sort((a, b) => Number(b.rating || 0) - Number(a.rating || 0))
+  }
+  // default 최신 (생성일 내림차순)
+  return arr.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+})
+
 const selectedRestaurantAverage = computed(() => {
   if (!selectedRestaurantReviews.value.length) return '0.0'
   const sum = selectedRestaurantReviews.value.reduce((total, r) => total + Number(r.rating || 0), 0)
@@ -541,34 +671,35 @@ const openEdit = (postId) => {
 };
 
 const handleSubmit = () => {
+  // 1. 수정 모드일 때
   if (isEditMode.value) {
-    // 1. 수정할 포스트 찾기
     const index = posts.value.findIndex(p => p.id === editingPostId.value);
     if (index !== -1) {
-      // 2. 새로운 객체로 대체하여 반응성 유지
       posts.value[index] = {
         ...posts.value[index],
         title: form.value.title,
         content: form.value.content,
         category: form.value.category,
-        restaurantName: form.value.restaurantName
-        ,
+        restaurantName: form.value.restaurantName,
         rating: Number(form.value.rating || 0)
       };
-
-      // 3. 로컬 스토리지 업데이트
       localStorage.setItem(STORAGE_KEY, JSON.stringify(posts.value));
     }
 
-    // 4. 상태 초기화
     isEditMode.value = false;
     editingPostId.value = null;
     isComposeOpen.value = false;
     resetForm();
+    return; // 수정 후 여기서 명확하게 종료합니다.
+  }
 
-  return
-}
-  if (!form.value.nickname || !form.value.title || !form.value.content) return
+  // 2. 신규 작성 모드일 때
+  if (!form.value.nickname || !form.value.title || !form.value.content) return;
+  
+  if (form.value.category === '가게리뷰' && !form.value.restaurantName) {
+    alert('가게리뷰를 작성하려면 가게 이름을 입력하세요.');
+    return;
+  }
 
   const newPost = {
     id: Date.now(),
@@ -580,60 +711,100 @@ const handleSubmit = () => {
     restaurantName: form.value.restaurantName || '',
     rating: Number(form.value.rating || 0),
     createdAt: new Date().toISOString(),
-  }
+  };
 
-  // 기존 배열 앞에 새 글 추가 후 반응성 갱신
-  posts.value = [newPost, ...posts.value]
+  posts.value = [newPost, ...posts.value];
 
   if (typeof window !== 'undefined') {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(posts.value))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(posts.value));
     if (form.value.password) {
-      const existing = JSON.parse(localStorage.getItem(PASSWORD_KEY) || '{}')
-      existing[newPost.id] = form.value.password
-      localStorage.setItem(PASSWORD_KEY, JSON.stringify(existing))
+      const existing = JSON.parse(localStorage.getItem(PASSWORD_KEY) || '{}');
+      existing[newPost.id] = form.value.password;
+      localStorage.setItem(PASSWORD_KEY, JSON.stringify(existing));
     }
   }
 
-  isComposeOpen.value = false
-  resetForm()
-}
+  isComposeOpen.value = false;
+  resetForm();
+};
 
 const selectRestaurant = (restaurant) => {
   selectedRestaurant.value = restaurant
-  if (mapInstance.value) {
+  // If using Kakao map SDK, center the Kakao map and add marker
+  if (KAKAO_MAP_KEY && window.kakao && mapInstance.value) {
+    try {
+      const lat = Number(restaurant.mapy)
+      const lng = Number(restaurant.mapx)
+      if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
+        const pos = new window.kakao.maps.LatLng(lat, lng)
+        mapInstance.value.setCenter(pos)
+        // add a mascot marker for the selected place
+        try {
+          // clear previous selected marker overlay if any
+          if (mapInstance.value._selectedMarker) mapInstance.value._selectedMarker.setMap(null)
+          const imageSize = new window.kakao.maps.Size(40, 40)
+          const imageOption = { offset: new window.kakao.maps.Point(20, 40) }
+          const markerImage = new window.kakao.maps.MarkerImage('/assets/mascot.png', imageSize, imageOption)
+          const marker = new window.kakao.maps.Marker({ position: pos, image: markerImage })
+          marker.setMap(mapInstance.value)
+          mapInstance.value._selectedMarker = marker
+        } catch (e) { /* ignore marker errors */ }
+      }
+    } catch (e) { /* ignore */ }
+  } else if (mapInstance.value && mapInstance.value.setView) {
     const lat = Number(restaurant.mapy)
     const lng = Number(restaurant.mapx)
     if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
       mapInstance.value.setView([lat, lng], 16, { animate: true })
     }
   }
-  // auto search related blogs for the selected restaurant
-  blogQuery.value = restaurant.title || ''
-  // call search but don't block UI
-  try { searchNaverBlogs() } catch (e) { console.warn('blog search failed', e) }
-}
-
-const createMasconDivIcon = (title) => {
-  const html = `
-    <div class="mascot-badge" title="${(title || '').replace(/"/g,'')}">
-      <img src="/assets/mascot.png" alt="m" />
-    </div>
-  `
-
-  return L.divIcon({
-    html,
-    className: 'mascot-div-icon',
-    iconSize: [24, 24],
-    iconAnchor: [12, 24],
-    popupAnchor: [0, -20]
-  })
+  // auto search related blogs for the selected restaurant and crawl them
+  try { searchNaverBlogsFor(restaurant.title || '') } catch (e) { console.warn('blog search failed', e) }
+  // fetch place rating via local scraper server (if available)
+  try { getPlaceRating(restaurant) } catch (e) { console.warn('rating fetch failed', e) }
 }
 
 
-const initLeafletMap = () => {
+
+async function getPlaceRating(restaurant) {
+  if (!restaurant || !restaurant.title) return
+  const q = `${restaurant.title} ${restaurant.addr1 || ''}`.trim()
+  // Local scraper removed — place rating unavailable in this build.
+  selectedRestaurant.value.__rating = null
+  selectedRestaurant.value.__reviewsCount = null
+}
+const initLeafletMap = async () => {
   const container = document.getElementById('kakao-map')
   if (!container) return
 
+  // If KAKAO map key is configured, initialize Kakao Maps SDK and create interactive map
+  if (KAKAO_MAP_KEY) {
+    container.innerHTML = ''
+    const loadKakao = () => new Promise((resolve, reject) => {
+      if (window.kakao && window.kakao.maps) return window.kakao.maps.load(resolve)
+      const s = document.createElement('script')
+      s.src = `//dapi.kakao.com/v2/maps/sdk.js?appkey=${KAKAO_MAP_KEY}&autoload=false&libraries=services`
+      s.onload = () => {
+        try { window.kakao.maps.load(resolve) } catch (e) { reject(e) }
+      }
+      s.onerror = reject
+      document.head.appendChild(s)
+    })
+
+    try {
+      await loadKakao()
+      const options = { center: new window.kakao.maps.LatLng(36.35, 127.38), level: 6 }
+      mapInstance.value = new window.kakao.maps.Map(container, options)
+      markerGroup.value = []
+      mapReady.value = true
+      renderMarkers()
+      return
+    } catch (e) {
+      console.warn('Kakao maps load failed', e)
+    }
+  }
+
+  // fallback: existing Leaflet map
   mapInstance.value = L.map(container).setView([36.35, 127.38], 10)
 
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -641,8 +812,10 @@ const initLeafletMap = () => {
   }).addTo(mapInstance.value)
 
   mapReady.value = true
-}
 
+  // 여기서부터 있던 createMasconDivIcon 중복 선언부를 모두 삭제했습니다.
+  // 이제 markers are rendered on demand via renderMarkers() to avoid cluttering map by default
+}
 async function searchNaverBlogs() {
   const q = (blogQuery.value || '').trim()
   if (!q) return alert('검색어를 입력하세요')
@@ -660,18 +833,32 @@ async function searchNaverBlogs() {
   }
 }
 
+// Search Netlify blog function and attempt to crawl each blog via local scraper to get full content
+async function searchNaverBlogsFor(q) {
+  if (!q) return
+  try {
+    const resp = await fetch(`/.netlify/functions/naverBlog?q=${encodeURIComponent(q)}`)
+    if (!resp.ok) {
+      const t = await resp.text()
+      throw new Error(t)
+    }
+    const json = await resp.json()
+    const items = (json.items || []).map((it) => ({ ...it }))
+    blogResults.value = items
+
+    // Local crawling via scraper removed — full blog content not fetched here.
+  } catch (err) {
+    console.error(err)
+  }
+}
+
 async function summarizeBlog(blog) {
   if (!blog || !blog.description) return
   if (!OPENAI_KEY) return alert('OpenAI 키가 설정되지 않았습니다.')
   try {
     blog.__loading = true
     const prompt = `다음 블로그 요약을 한국어로 2문장 이하로 간결하게 요약해줘.\n\n${blog.description}`
-    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages: [{ role: 'user', content: prompt }], max_tokens: 120, temperature: 0.5 }),
-    })
-    const data = await resp.json()
+    const { data } = await callOpenAI([{ role: 'user', content: prompt }], { max_tokens: 120, temperature: 0.5 })
     const text = data?.choices?.[0]?.message?.content || ''
     blog.__summary = text
   } catch (err) {
@@ -684,20 +871,46 @@ async function summarizeBlog(blog) {
 
 async function analyzeBlog(blog) {
   if (!blog || !blog.description) return
+  if (blog.__analysis) return
   if (!OPENAI_KEY) return alert('OpenAI 키가 설정되지 않았습니다.')
   const systemPrompt = `당신은 온라인 리뷰가 사람이 작성한 실제 후기인지, 아니면 AI(예: GPT, CLOVA 등)를 이용해 기계적으로 대량 생성한 'AI 생성 리뷰'인지를 판별하는 텍스트 분석 전문가입니다.\n\n다음 특징들을 기준으로 주어진 리뷰를 평가해줘:\n1. 지나치게 정돈된 문장 구조와 백과사전식 표현\n2. 감정의 깊이 부족\n3. 어색하거나 지나치게 기계적인 접속사 사용\n4. 반복적인 키워드 배치 패턴\n\n응답은 반드시 JSON 형식으로 다음과 같이만 반환하세요.\n{\n  "ai_writing_probability_percentage": 0,\n  "reasons": ["..."],\n  "verdict": "사람 작성 의심"\n}`
   try {
     blog.__loading = true
     const userPayload = `리뷰: ${blog.description}`
-    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPayload }], max_tokens: 200, temperature: 0.2 }),
-    })
-    const data = await resp.json()
+    const { data } = await callOpenAI([{ role: 'system', content: improvedDetectionPrompt }, { role: 'user', content: userPayload }], { max_tokens: 200, temperature: 0.2 })
     const aiText = data?.choices?.[0]?.message?.content || ''
+
+    // try to extract JSON substring first
     let parsed = null
-    try { parsed = JSON.parse(aiText) } catch (e) { parsed = { ai_writing_probability_percentage: null, reasons: [aiText], verdict: '판단 보류' } }
+    const tryParseJson = (text) => {
+      if (!text) return null
+      // try direct parse
+      try { return JSON.parse(text) } catch (e) {}
+      // try extracting {...} block
+      const m = text.match(/\{[\s\S]*\}/)
+      if (m) {
+        try { return JSON.parse(m[0]) } catch (e) {}
+      }
+      return null
+    }
+
+    parsed = tryParseJson(aiText)
+
+    if (!parsed) {
+      // ask model to return strict JSON only, include previous response for context
+      try {
+        const fixPrompt = `The previous response was:\n\n${aiText}\n\nIt did not follow the required JSON-only output. Please reformat and return ONLY the JSON in the exact schema previously requested.`
+        const { data: d2 } = await callOpenAI([{ role: 'system', content: systemPrompt }, { role: 'user', content: fixPrompt }], { max_tokens: 200, temperature: 0.0 })
+        const aiText2 = d2?.choices?.[0]?.message?.content || ''
+        parsed = tryParseJson(aiText2)
+        if (!parsed) parsed = { ai_writing_probability_percentage: null, reasons: [aiText, aiText2], verdict: '판단 보류' }
+      } catch (e) {
+        parsed = { ai_writing_probability_percentage: null, reasons: [aiText], verdict: '판단 보류' }
+      }
+    }
+    // normalize fields
+    parsed.ai_writing_probability_percentage = parsed.ai_writing_probability_percentage == null ? null : Number(parsed.ai_writing_probability_percentage)
+    if (!Array.isArray(parsed.reasons)) parsed.reasons = parsed.reasons ? [String(parsed.reasons)] : []
     blog.__analysis = parsed
   } catch (err) {
     console.error(err)
@@ -746,6 +959,34 @@ function renderMarkers() {
   })
 
   // add markers to group
+  // Kakao maps marker rendering
+  if (KAKAO_MAP_KEY && window.kakao && mapInstance.value && mapInstance.value.setCenter) {
+    // clear previous markers
+    if (Array.isArray(markerGroup.value)) {
+      for (const mk of markerGroup.value) try { mk.setMap(null) } catch (e) {}
+    }
+    markerGroup.value = []
+
+    restaurantList.value.forEach((restaurant) => {
+      const lat = Number(restaurant.mapy)
+      const lng = Number(restaurant.mapx)
+      if (Number.isNaN(lat) || Number.isNaN(lng)) return
+      const pos = new window.kakao.maps.LatLng(lat, lng)
+      const imageSize = new window.kakao.maps.Size(36, 36)
+      const imageOption = { offset: new window.kakao.maps.Point(18, 36) }
+      const markerImage = new window.kakao.maps.MarkerImage('/assets/mascot.png', imageSize, imageOption)
+      const marker = new window.kakao.maps.Marker({ position: pos, image: markerImage })
+      marker.setMap(mapInstance.value)
+      const iw = new window.kakao.maps.InfoWindow({ content: `<div style="padding:8px;font-size:13px"><strong>${restaurant.title}</strong><br/>${restaurant.addr1 || ''}</div>` })
+      window.kakao.maps.event.addListener(marker, 'click', () => { selectRestaurant(restaurant); iw.open(mapInstance.value, marker) })
+      markerGroup.value.push(marker)
+    })
+    return
+  }
+
+  // Leaflet fallback
+  if (!markerGroup.value) markerGroup.value = L.layerGroup()
+  markerGroup.value.clearLayers()
   restaurantList.value.forEach((restaurant) => {
     const lat = Number(restaurant.mapy)
     const lng = Number(restaurant.mapx)
@@ -763,10 +1004,7 @@ function renderMarkers() {
       </div>
     `)
 
-    m.on('click', () => {
-      selectRestaurant(restaurant)
-      m.openPopup()
-    })
+    m.on('click', () => { selectRestaurant(restaurant); m.openPopup() })
 
     markerGroup.value.addLayer(m)
   })
@@ -830,20 +1068,11 @@ const sendChatMessage = async () => {
     const tempIdx = chatMessages.value.push({ role: 'bot', text: '...', temp: true }) - 1
 
     const messages = buildLLMMessages(generalSystem, text)
-    const respGen = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages, max_tokens: 300, temperature: 0.7 }),
-    })
-    if (!respGen.ok) {
-      const t = await respGen.text()
-      // remove temp indicator
-      if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) chatMessages.value.splice(tempIdx, 1)
-      isProcessing.value = false
-      throw new Error('OpenAI error: ' + t)
+    const { data: dataGen } = await callOpenAI(messages, { max_tokens: 300, temperature: 0.7 })
+    let replyText = dataGen?.choices?.[0]?.message?.content || ''
+    if (!replyText) {
+      replyText = '대전 음식점과 관광 정보에 대해 편하게 질문해 주세요. 예: "대전 맛집 추천해줘"'
     }
-    const dataGen = await respGen.json()
-    const replyText = dataGen?.choices?.[0]?.message?.content || '죄송합니다. 다시 시도해 주세요.'
     // replace temp indicator with actual reply
     if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) {
       chatMessages.value[tempIdx] = { role: 'bot', text: replyText }
@@ -878,8 +1107,8 @@ const sendChatMessage = async () => {
       mapy: it.mapy || '',
     }))
 
-    const systemPrompt = `당신은 대전 지역 음식점 추천 전문가입니다.
-사용자 질문을 해석하여, 아래에 제공된 'items' 배열 안에서만 후보를 선택해 최대 6개까지 추천하세요.
+    const systemPrompt = `당신은 대전·충청권 음식점 데이터를 기반으로 답하는 챗봇입니다.
+사용자의 질문 의도(추천/비교/설명/위치 확인 등)를 스스로 판단하고, 아래에 제공된 'items' 배열 안의 실제 데이터만 사용해 답하세요.
 반드시 한국어로 간결하게 답변하고, 응답은 정확한 JSON만 반환해야 합니다. 다른 텍스트를 섞지 마세요.
 
 요구 JSON 형식:
@@ -892,16 +1121,17 @@ const sendChatMessage = async () => {
 
 지침:
 - 절대 'items' 밖의 정보를 후보로 사용하지 마세요. 후보는 반드시 'contentid'로 items에 매핑되어야 합니다.
-- 그러나 카테고리 지정이 불명확하거나 실패하면, 제공된 items 중 '유사도'가 가장 높은 항목을 골라 최대 6개를 구성하세요. 즉각적으로 빈 배열을 반환하지 마세요.
-- 사용자가 특정 카테고리를 엄격히 요청하면 그 카테고리와 명확히 일치하는 항목을 우선하세요. 만약 전혀 없으면, 가장 관련성이 높은 항목을 제공하시고 그 사유를 간단히 요약해 주세요.
+- 답변은 title, addr1, tel, category2/category3 같은 제공된 데이터 값으로 근거를 세우세요.
+- 사용자 질문이 추천이면, 가장 관련성이 높은 항목을 최대 6개까지 고르고, 이유를 간단히 설명하세요.
+- 사용자가 특정 카테고리나 지역을 요청하면 그 조건과 맞는 항목을 우선하세요. 없으면 가장 관련성이 높은 항목을 제시하고 사유를 짧게 설명하세요.
 - 관련 항목이 전혀 없다고 판단되면 "candidates"를 빈 배열로 하고 "reply"에 정확히 이 문구를 넣으세요: "죄송합니다. 대전 지역 음식점 관련 질문을 해주세요."`
 
     const userPayload = `items:\n${JSON.stringify(itemsForLLM)}\n\n질문: ${text}`
 
     if (!OPENAI_KEY) {
-      // No key configured — fallback to local retrieval
+      // No key configured — use local dataset-based fallback
       const fallbackHits = retrieve(text, 6)
-      const reply = fallbackHits.length ? '요청하신 기준으로 몇 곳 추천드릴게요.' : '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.'
+      const reply = buildLocalRestaurantReply(text, fallbackHits)
       const candidates = fallbackHits.map((it) => ({
         contentid: it.contentid || '',
         title: it.title || '',
@@ -922,32 +1152,21 @@ const sendChatMessage = async () => {
     const tempIdx = chatMessages.value.push({ role: 'bot', text: '...', temp: true }) - 1
 
     const messages = buildLLMMessages(systemPrompt, userPayload)
-    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
-        messages,
-        max_tokens: 700,
-        temperature: 0.2,
-      }),
-    })
-
-    if (!resp.ok) {
-      const txt = await resp.text()
-      throw new Error('OpenAI error: ' + txt)
-    }
-
-    const data = await resp.json()
-    const aiText = data?.choices?.[0]?.message?.content
+    const { data } = await callOpenAI(messages, { max_tokens: 700, temperature: 0.2 })
+    let aiText = data?.choices?.[0]?.message?.content || ''
     if (!aiText) {
-      if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) chatMessages.value.splice(tempIdx, 1)
-      isProcessing.value = false
-      chatMessages.value.push({ role: 'bot', text: '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.' })
-      return
+      const fallbackHits = retrieve(text, 6)
+      const fallbackReply = buildLocalRestaurantReply(text, fallbackHits)
+      aiText = JSON.stringify({ reply: fallbackReply, candidates: fallbackHits.map((it) => ({
+        contentid: it.contentid || '',
+        title: it.title || '',
+        addr1: it.addr1 || '',
+        zipcode: it.zipcode || '',
+        tel: it.tel || '',
+        firstimage: it.firstimage || it.firstimage2 || '',
+        mapx: it.mapx || '',
+        mapy: it.mapy || '',
+      })) })
     }
 
     let parsed = null
@@ -1000,7 +1219,7 @@ const sendChatMessage = async () => {
     isProcessing.value = false
   } catch (err) {
     console.error(err)
-    chatMessages.value.push({ role: 'bot', text: '서버에 연결할 수 없습니다.' })
+    chatMessages.value.push({ role: 'bot', text: `챗봇 응답 처리 중 오류가 발생했습니다. ${err?.message || ''}`.trim() })
   }
 }
 
@@ -1143,6 +1362,9 @@ function onImgError(e, title) {
                 {{ showMarkers ? '마커 숨기기' : '마커 보기' }}
               </button>
             </div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <div style="font-size:13px; color:#6b7280;">선택한 장소의 위치와 관련 블로그를 자동으로 표시합니다.</div>
+            </div>
           </div>
         </div>
 
@@ -1161,8 +1383,8 @@ function onImgError(e, title) {
         </div>
 
         <div id="kakao-map" class="kakao-map"></div>
-        <div v-if="!mapReady && MAP_KEY" class="map-loading">지도를 불러오는 중입니다...</div>
-        <div v-else-if="!MAP_KEY" class="map-loading"></div>
+        <div v-if="!mapReady && KAKAO_MAP_KEY" class="map-loading">지도를 불러오는 중입니다...</div>
+        <div v-else-if="!KAKAO_MAP_KEY" class="map-loading"></div>
 
         <!-- 세로 1줄 목록 형태로 교체된 영역 -->
         <div class="restaurant-list-container">
@@ -1205,6 +1427,11 @@ function onImgError(e, title) {
             <a v-if="mapLink" :href="mapLink" target="_blank" rel="noreferrer">
               지도에서 위치 보기
             </a>
+            <div v-if="selectedRestaurant.__rating !== undefined && selectedRestaurant.__rating !== null" style="margin-top:8px;">
+              <strong>네이버 평점:</strong>
+              <span :class="selectedRestaurant.__rating >=4 ? 'rating-high' : selectedRestaurant.__rating >=3 ? '' : 'rating-low'"> {{ selectedRestaurant.__rating }} </span>
+              <small style="color:#6b7280">({{ selectedRestaurant.__reviewsCount || '후기 수 없음' }}건)</small>
+            </div>
           </div>
 
           <div class="blog-results-store" style="margin-top:12px;">
@@ -1245,11 +1472,21 @@ function onImgError(e, title) {
 
         <div v-else class="empty-state">지도에서 가게를 선택하면 장소 정보가 나타납니다.</div>
 
-        <div v-for="review in selectedRestaurantReviews" :key="review.id" class="review-item">
-          <div class="review-header">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <div style="font-weight:700">리뷰</div>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <label style="font-size:13px; color:#6b7284">정렬:</label>
+            <select v-model="sortOption">
+              <option>최신</option>
+              <option>평점순</option>
+            </select>
+          </div>
+        </div>
+        <div v-for="review in sortedSelectedReviews" :key="review.id" class="review-item">
+            <div class="review-header">
             <strong>{{ review.title }}</strong>
             <div style="display:flex; gap:8px; align-items:center;">
-              <span>⭐ {{ Number(review.rating || 0).toFixed(1) }}</span>
+              <span :class="Number(review.rating || 0) >= 4 ? 'rating-high' : Number(review.rating || 0) >= 3 ? '' : 'rating-low'">⭐ {{ Number(review.rating || 0).toFixed(1) }}</span>
               <span>{{ review.nickname }}</span>
             </div>
           </div>
@@ -1782,6 +2019,16 @@ function onImgError(e, title) {
   object-fit: cover;
 }
 
+.store-rating{
+  margin:8px 0 14px;
+  color:#ff9800;
+  font-weight:bold;
+  font-size:16px;
+}
+
+.rating-high { color: #2f855a; font-weight:700 }
+.rating-low { color: #d9534f; font-weight:700 }
+
 .kakao-place-info {
   margin-top: 12px;
   padding: 12px;
@@ -2009,6 +2256,17 @@ button.secondary:hover {
   box-shadow: 0 8px 24px rgba(224,122,59,0.22);
   z-index: 88;
 }
+
+/* Guard: prevent raw mascot images from overflowing layout */
+img[src="/assets/mascot.png"] {
+  max-width: 88px;
+  max-height: 88px;
+  width: auto;
+  height: auto;
+}
+
+/* Ensure map container layout stays bounded */
+.kakao-map { overflow: hidden; min-height: 200px; }
 
 .chat-float {
   position: fixed;
