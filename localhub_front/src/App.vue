@@ -1,15 +1,28 @@
 <script setup>
 import { computed, onMounted, ref, watch, nextTick } from 'vue'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
+
+// fix Leaflet default icon paths for Vite
+delete L.Icon.Default.prototype._getIconUrl
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: new URL('leaflet/dist/images/marker-icon-2x.png', import.meta.url).href,
+  iconUrl: new URL('leaflet/dist/images/marker-icon.png', import.meta.url).href,
+  shadowUrl: new URL('leaflet/dist/images/marker-shadow.png', import.meta.url).href,
+})
 import restaurantsData from './data/대전_충청권_음식점.json'
 
 const STORAGE_KEY = 'localhub-posts-v2'
 const PASSWORD_KEY = 'localhub-passwords-v2'
 const BOOKMARK_KEY = 'localhub-bookmarks-v1'
 const MAP_KEY = import.meta.env.VITE_KAKAO_MAP_KEY || ''
+const OPENAI_KEY = import.meta.env.VITE_OPENAI_API_KEY || ''
 
 const activeTab = ref('메인')
 const searchKeyword = ref('')
 const restaurantSearch = ref('')
+const blogQuery = ref('')
+const blogResults = ref([])
 const posts = ref([])
 const selectedRestaurant = ref(null)
 const isComposeOpen = ref(false)
@@ -36,6 +49,9 @@ const chatMessages = ref([
     text: '안녕하세요. 저는 대전 지역 음식점 데이터만 참조해 답변하는 챗봇입니다. 업소명/주소/우편번호/카테고리로 질문해주세요.',
   },
 ])
+const chatLogRef = ref(null)
+const isProcessing = ref(false)
+// Backend removed per 의뢰서: front-end will call OpenAI directly using `VITE_OPENAI_API_KEY`.
 
 // Build follow-up options from local JSON when LLM fails to provide candidates
 function buildFollowups(userQuery) {
@@ -77,9 +93,37 @@ function buildFollowups(userQuery) {
 
   return options
 }
+
+// Lightweight client-side retrieval fallback (used when LLM unavailable)
+function retrieve(query, limit = 6) {
+  const q = (query || '').toLowerCase().trim()
+  if (!q) return []
+
+  // strict title/address match first
+  const direct = restaurantsData.items.filter((it) => {
+    const hay = [it.title, it.addr1, it.zipcode, it.tel].filter(Boolean).join(' ').toLowerCase()
+    return hay.includes(q)
+  })
+  if (direct.length) return direct.slice(0, limit)
+
+  // category heuristics
+  if (q.includes('한식')) return restaurantsData.items.filter((it) => (it.lclsSystm2 || '').includes('FD01')).slice(0, limit)
+  if (q.includes('카페') || q.includes('커피')) return restaurantsData.items.filter((it) => (it.lclsSystm2 || '').includes('FD05')).slice(0, limit)
+  if (q.includes('베이커리') || q.includes('빵') || q.includes('제과')) return restaurantsData.items.filter((it) => (it.lclsSystm2 || '').includes('FD03')).slice(0, limit)
+
+  // broad recommendation for vague queries
+  if (q.includes('맛집') || q.includes('추천') || q.includes('추천해')) {
+    const withImage = restaurantsData.items.filter((it) => it.firstimage || it.firstimage2).slice(0, limit)
+    return withImage.length ? withImage : restaurantsData.items.slice(0, limit)
+  }
+
+  return []
+}
 // searchResults is no longer used globally; candidates are rendered inline in chatMessages
 const mapInstance = ref(null)
 const mapReady = ref(false)
+const markerGroup = ref(null)
+const showMarkers = ref(true) // markers shown by default
 const restaurantList = ref(restaurantsData.items.slice(0, 40))
 
 // --- 카테고리 필터 관련 상태 (선택 항목에 '기타' 추가) ---
@@ -161,16 +205,12 @@ const selectedRestaurantImage = computed(() => {
   return selectedRestaurant.value.firstimage || selectedRestaurant.value.firstimage2 || ''
 })
 
-const kakaoPlaceLink = computed(() => {
+const mapLink = computed(() => {
   if (!selectedRestaurant.value) return ''
-  if (selectedRestaurant.value.mapx && selectedRestaurant.value.mapy) {
-    return `https://map.kakao.com/link/map/${encodeURIComponent(
-      selectedRestaurant.value.title
-    )},${selectedRestaurant.value.mapy},${selectedRestaurant.value.mapx}`
-  }
-  return `https://map.kakao.com/link/search/${encodeURIComponent(
-    selectedRestaurant.value.addr1 || selectedRestaurant.value.title
-  )}`
+  const lat = selectedRestaurant.value.mapy
+  const lng = selectedRestaurant.value.mapx
+  if (lat && lng) return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lng}#map=18/${lat}/${lng}`
+  return `https://www.openstreetmap.org/search?query=${encodeURIComponent(selectedRestaurant.value.addr1 || selectedRestaurant.value.title)}`
 })
 
 const initializePosts = () => {
@@ -271,18 +311,9 @@ onMounted(() => {
     }
   }
 
-  if (typeof window !== 'undefined' && window.kakao?.maps) {
-    initKakaoMap()
-  } else if (typeof window !== 'undefined' && MAP_KEY) {
-    const script = document.createElement('script')
-    script.src = `https://dapi.kakao.com/v2/maps/sdk.js?appkey=${MAP_KEY}&autoload=false`
-    script.onload = () => {
-      window.kakao.maps.load(initKakaoMap)
-    }
-    script.onerror = () => {
-      console.error('Kakao SDK 로드 실패', script.src)
-    }
-    document.head.appendChild(script)
+  // initialize Leaflet map (no API key required)
+  if (typeof window !== 'undefined') {
+    setTimeout(() => initLeafletMap(), 50)
   }
 })
 
@@ -305,6 +336,11 @@ watch(
   },
   { deep: true },
 )
+
+// render markers when map is ready
+watch(mapReady, () => {
+  if (mapReady.value) renderMarkers()
+})
 
 const currentBoardTitle = computed(() => {
   if (activeTab.value === '자유주제') return '자유주제'
@@ -523,48 +559,142 @@ if (isEditMode.value) {
 
 const selectRestaurant = (restaurant) => {
   selectedRestaurant.value = restaurant
-  if (mapInstance.value && window.kakao?.maps) {
+  if (mapInstance.value) {
     const lat = Number(restaurant.mapy)
     const lng = Number(restaurant.mapx)
     if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
-      const moveLatLon = new window.kakao.maps.LatLng(lat, lng)
-      mapInstance.value.panTo(moveLatLon)
-      mapInstance.value.setLevel(4)
+      mapInstance.value.setView([lat, lng], 16, { animate: true })
     }
+  }
+  // auto search related blogs for the selected restaurant
+  blogQuery.value = restaurant.title || ''
+  // call search but don't block UI
+  try { searchNaverBlogs() } catch (e) { console.warn('blog search failed', e) }
+}
+
+const initLeafletMap = () => {
+  const container = document.getElementById('kakao-map')
+  if (!container) return
+
+  mapInstance.value = L.map(container).setView([36.35, 127.38], 10)
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors',
+  }).addTo(mapInstance.value)
+  mapReady.value = true
+
+  // create a badge-style DivIcon that contains the mascot image and gradient
+    const createMasconDivIcon = (title) => {
+    const html = `
+      <div class="mascot-badge" title="${(title||'').replace(/"/g,'')}">
+        <img src="/assets/mascot.png" alt="m" />
+      </div>`
+    // smaller icon for better map density
+    return L.divIcon({ html, className: 'mascot-div-icon', iconSize: [24, 24], iconAnchor: [12, 24], popupAnchor: [0, -20] })
+  }
+
+  // markers are rendered on demand via renderMarkers() to avoid cluttering map by default
+}
+
+async function searchNaverBlogs() {
+  const q = (blogQuery.value || '').trim()
+  if (!q) return alert('검색어를 입력하세요')
+  try {
+    const resp = await fetch(`/.netlify/functions/naverBlog?q=${encodeURIComponent(q)}`)
+    if (!resp.ok) {
+      const t = await resp.text()
+      throw new Error(t)
+    }
+    const json = await resp.json()
+    blogResults.value = json.items || []
+  } catch (err) {
+    console.error(err)
+    alert('블로그 검색에 실패했습니다.')
   }
 }
 
-const initKakaoMap = () => {
-  if (!window.kakao?.maps || !document.getElementById('kakao-map')) return
-
-  const container = document.getElementById('kakao-map')
-  const options = {
-    center: new window.kakao.maps.LatLng(36.35, 127.38),
-    level: 10,
+async function summarizeBlog(blog) {
+  if (!blog || !blog.description) return
+  if (!OPENAI_KEY) return alert('OpenAI 키가 설정되지 않았습니다.')
+  try {
+    blog.__loading = true
+    const prompt = `다음 블로그 요약을 한국어로 2문장 이하로 간결하게 요약해줘.\n\n${blog.description}`
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
+      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages: [{ role: 'user', content: prompt }], max_tokens: 120, temperature: 0.5 }),
+    })
+    const data = await resp.json()
+    const text = data?.choices?.[0]?.message?.content || ''
+    blog.__summary = text
+  } catch (err) {
+    console.error(err)
+    blog.__summary = '요약 실패'
+  } finally {
+    blog.__loading = false
   }
-  mapInstance.value = new window.kakao.maps.Map(container, options)
-  mapReady.value = true
+}
 
+async function analyzeBlog(blog) {
+  if (!blog || !blog.description) return
+  if (!OPENAI_KEY) return alert('OpenAI 키가 설정되지 않았습니다.')
+  const systemPrompt = `당신은 온라인 리뷰가 사람이 작성한 실제 후기인지, 아니면 AI(예: GPT, CLOVA 등)를 이용해 기계적으로 대량 생성한 'AI 생성 리뷰'인지를 판별하는 텍스트 분석 전문가입니다.\n\n다음 특징들을 기준으로 주어진 리뷰를 평가해줘:\n1. 지나치게 정돈된 문장 구조와 백과사전식 표현\n2. 감정의 깊이 부족\n3. 어색하거나 지나치게 기계적인 접속사 사용\n4. 반복적인 키워드 배치 패턴\n\n응답은 반드시 JSON 형식으로 다음과 같이만 반환하세요.\n{\n  "ai_writing_probability_percentage": 0,\n  "reasons": ["..."],\n  "verdict": "사람 작성 의심"\n}`
+  try {
+    blog.__loading = true
+    const userPayload = `리뷰: ${blog.description}`
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
+      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPayload }], max_tokens: 200, temperature: 0.2 }),
+    })
+    const data = await resp.json()
+    const aiText = data?.choices?.[0]?.message?.content || ''
+    let parsed = null
+    try { parsed = JSON.parse(aiText) } catch (e) { parsed = { ai_writing_probability_percentage: null, reasons: [aiText], verdict: '판단 보류' } }
+    blog.__analysis = parsed
+  } catch (err) {
+    console.error(err)
+    blog.__analysis = { ai_writing_probability_percentage: null, reasons: ['분석 실패'], verdict: '판단 보류' }
+  } finally {
+    blog.__loading = false
+  }
+}
+
+async function batchAnalyzeAll() {
+  if (!blogResults.value || blogResults.value.length === 0) return
+  for (const b of blogResults.value) {
+    // sequential to avoid rate limits
+    await analyzeBlog(b)
+  }
+  alert('일괄 분석 완료')
+}
+
+function renderMarkers() {
+  if (!mapInstance.value) return
+  // ensure markerGroup exists
+  if (!markerGroup.value) markerGroup.value = L.layerGroup()
+
+  // clear previous markers
+  markerGroup.value.clearLayers()
+
+  // add markers to group
   restaurantList.value.forEach((restaurant) => {
     const lat = Number(restaurant.mapy)
     const lng = Number(restaurant.mapx)
     if (Number.isNaN(lat) || Number.isNaN(lng)) return
-
-    const marker = new window.kakao.maps.Marker({
-      position: new window.kakao.maps.LatLng(lat, lng),
-      map: mapInstance.value,
-    })
-
-    const infoWindow = new window.kakao.maps.InfoWindow({
-      content: `<div style="padding:8px 10px; font-size:13px;"><strong>${restaurant.title}</strong><br/>${restaurant.addr1}</div>`,
-    })
-
-    window.kakao.maps.event.addListener(marker, 'click', () => {
+    const m = L.marker([lat, lng], { icon: createMasconDivIcon(restaurant.title) })
+    m.bindPopup(`<div style="padding:8px 10px; font-size:13px;"><strong>${restaurant.title}</strong><br/>${restaurant.addr1}</div>`)
+    m.on('click', () => {
       selectRestaurant(restaurant)
-      infoWindow.open(mapInstance.value, marker)
+      m.openPopup()
     })
+    markerGroup.value.addLayer(m)
   })
+
+  // add group to map if not present
+  try { markerGroup.value.addTo(mapInstance.value) } catch (e) {}
 }
+
+// toggleMarkers removed — markers are shown by default
 
 const toggleBookmark = (postId) => {
   if (bookmarkedPostIds.value.includes(postId)) {
@@ -581,108 +711,226 @@ const sendChatMessage = async () => {
   chatMessages.value.push({ role: 'user', text })
   chatInput.value = ''
 
-  try {
-    const resp = await fetch('http://localhost:3000/api/chat', {
+  // 간단한 의도 분류: 음식점 추천 관련 질의인지 여부
+  const isRestaurantQueryText = (s) => {
+    if (!s) return false
+    const low = s.toLowerCase()
+    const kws = ['맛집', '추천', '식당', '대전', '가게', '음식', '맛있는', '여행지', '관광', '카페', '맛집추천', '추천해']
+    return kws.some((k) => low.includes(k))
+  }
+
+  const isFood = isRestaurantQueryText(text)
+  const low = text.toLowerCase()
+  const greetings = ['안녕', '안녕하세요', '하이', 'hello', 'hi', '반가워', '잘 지내']
+
+  // 간단한 인사/잡담은 로컬에서 응답
+  if (!isFood && greetings.some((g) => low.includes(g))) {
+    chatMessages.value.push({ role: 'bot', text: '안녕하세요! 대전 지역 음식점이나 관광 정보, 추천이 필요하시면 편하게 말씀해 주세요.' })
+    return
+  }
+
+  // 음식점 관련 질의가 아니라면 일반 대화 모드로 OpenAI에 자연스러운 응답 요청
+  if (!isFood) {
+    if (!OPENAI_KEY) {
+      chatMessages.value.push({ role: 'bot', text: '현재는 일반 대화 기능을 사용할 수 없습니다. 음식점 추천을 요청해 보세요.' })
+      return
+    }
+    const generalSystem = `당신은 친절한 지역 안내 챗봇입니다. 사용자의 질문에 공감하고 자연스럽게 대화하세요. 필요하면 대전 음식점 데이터에 기반한 추천을 제안하되, 일반적인 질문에는 대화형 한국어 문장으로 응답하세요.`
+    // show typing indicator
+    isProcessing.value = true
+    const tempIdx = chatMessages.value.push({ role: 'bot', text: '...', temp: true }) - 1
+
+    const messages = buildLLMMessages(generalSystem, text)
+    const respGen = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
+      body: JSON.stringify({ model: 'gpt-3.5-turbo', messages, max_tokens: 300, temperature: 0.7 }),
     })
-    const json = await resp.json()
-    let reply = json?.reply || '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.'
-    // 특정 내부 폴백 안내 문구는 사용자에게 노출하지 않음
-    if (reply && reply.includes('모델 접근 권한')) {
-      reply = '요청하신 기준으로 몇 곳 추천드릴게요.'
+    if (!respGen.ok) {
+      const t = await respGen.text()
+      // remove temp indicator
+      if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) chatMessages.value.splice(tempIdx, 1)
+      isProcessing.value = false
+      throw new Error('OpenAI error: ' + t)
+    }
+    const dataGen = await respGen.json()
+    const replyText = dataGen?.choices?.[0]?.message?.content || '죄송합니다. 다시 시도해 주세요.'
+    // replace temp indicator with actual reply
+    if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) {
+      chatMessages.value[tempIdx] = { role: 'bot', text: replyText }
+    } else {
+      chatMessages.value.push({ role: 'bot', text: replyText })
+    }
+    isProcessing.value = false
+    return
+  }
+
+  try {
+    const POOL_SIZE = 60
+    // prioritize retrieved hits, then pad with generic items
+    let poolItems = retrieve(text, POOL_SIZE)
+    if (!poolItems || poolItems.length === 0) poolItems = restaurantsData.items.slice(0, POOL_SIZE)
+    if (poolItems.length < POOL_SIZE) {
+      const ids = new Set(poolItems.map((i) => i.contentid))
+      const pad = restaurantsData.items.filter((r) => !ids.has(r.contentid)).slice(0, POOL_SIZE - poolItems.length)
+      poolItems = poolItems.concat(pad)
     }
 
-    // If server gives a generic '요청하신 기준으로 몇 곳 추천드릴게요.', do NOT display it.
-    // - If candidates exist, we'll render them below without showing this generic text.
-    // - If no candidates, show a category selection prompt instead.
-    const NEED_CATEGORY_MSG = '요청하신 기준으로 몇 곳 추천드릴게요.'
-    if (reply === NEED_CATEGORY_MSG) {
-      if (!json?.candidates || json.candidates.length === 0) {
-        const followups = buildFollowups(text)
-        chatMessages.value.push({ role: 'bot', text: '카테고리를 선택해 주세요. 아래에서 골라주세요.', followups })
-      }
-      // otherwise: skip pushing the generic reply entirely
+    const itemsForLLM = poolItems.map((it) => ({
+      contentid: it.contentid || '',
+      title: it.title || '',
+      addr1: it.addr1 || '',
+      zipcode: it.zipcode || '',
+      tel: it.tel || '',
+      firstimage: it.firstimage || it.firstimage2 || '',
+      category2: it.lclsSystm2 || '',
+      category3: it.lclsSystm3 || '',
+      mapx: it.mapx || '',
+      mapy: it.mapy || '',
+    }))
+
+    const systemPrompt = `당신은 대전 지역 음식점 추천 전문가입니다.
+사용자 질문을 해석하여, 아래에 제공된 'items' 배열 안에서만 후보를 선택해 최대 6개까지 추천하세요.
+반드시 한국어로 간결하게 답변하고, 응답은 정확한 JSON만 반환해야 합니다. 다른 텍스트를 섞지 마세요.
+
+요구 JSON 형식:
+{
+  "reply": "사용자에게 보낼 간결한 한국어 메시지",
+  "candidates": [
+    {"contentid":"<contentid>", "title":"","addr1":"","zipcode":"","tel":"","firstimage":"","mapx":"","mapy":""}
+  ]
+}
+
+지침:
+- 절대 'items' 밖의 정보를 후보로 사용하지 마세요. 후보는 반드시 'contentid'로 items에 매핑되어야 합니다.
+- 그러나 카테고리 지정이 불명확하거나 실패하면, 제공된 items 중 '유사도'가 가장 높은 항목을 골라 최대 6개를 구성하세요. 즉각적으로 빈 배열을 반환하지 마세요.
+- 사용자가 특정 카테고리를 엄격히 요청하면 그 카테고리와 명확히 일치하는 항목을 우선하세요. 만약 전혀 없으면, 가장 관련성이 높은 항목을 제공하시고 그 사유를 간단히 요약해 주세요.
+- 관련 항목이 전혀 없다고 판단되면 "candidates"를 빈 배열로 하고 "reply"에 정확히 이 문구를 넣으세요: "죄송합니다. 대전 지역 음식점 관련 질문을 해주세요."`
+
+    const userPayload = `items:\n${JSON.stringify(itemsForLLM)}\n\n질문: ${text}`
+
+    if (!OPENAI_KEY) {
+      // No key configured — fallback to local retrieval
+      const fallbackHits = retrieve(text, 6)
+      const reply = fallbackHits.length ? '요청하신 기준으로 몇 곳 추천드릴게요.' : '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.'
+      const candidates = fallbackHits.map((it) => ({
+        contentid: it.contentid || '',
+        title: it.title || '',
+        addr1: it.addr1 || '',
+        zipcode: it.zipcode || '',
+        tel: it.tel || '',
+        firstimage: it.firstimage || it.firstimage2 || '',
+        mapx: it.mapx || '',
+        mapy: it.mapy || '',
+      }))
+      if (reply) chatMessages.value.push({ role: 'bot', text: reply })
+      if (candidates.length) chatMessages.value.push({ role: 'bot', candidates })
+      return
+    }
+
+    // show typing indicator
+    isProcessing.value = true
+    const tempIdx = chatMessages.value.push({ role: 'bot', text: '...', temp: true }) - 1
+
+    const messages = buildLLMMessages(systemPrompt, userPayload)
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-3.5-turbo',
+        messages,
+        max_tokens: 700,
+        temperature: 0.2,
+      }),
+    })
+
+    if (!resp.ok) {
+      const txt = await resp.text()
+      throw new Error('OpenAI error: ' + txt)
+    }
+
+    const data = await resp.json()
+    const aiText = data?.choices?.[0]?.message?.content
+    if (!aiText) {
+      if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) chatMessages.value.splice(tempIdx, 1)
+      isProcessing.value = false
+      chatMessages.value.push({ role: 'bot', text: '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.' })
+      return
+    }
+
+    let parsed = null
+    try {
+      parsed = JSON.parse(aiText)
+    } catch (e) {
+      // If LLM didn't return strict JSON, show text answer
+      chatMessages.value.push({ role: 'bot', text: aiText })
+      return
+    }
+
+    const reply = parsed.reply || '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.'
+    const rawCandidates = Array.isArray(parsed.candidates) ? parsed.candidates : []
+
+    const byId = new Map(restaurantsData.items.map((r) => [String(r.contentid), r]))
+    const validated = []
+    for (const c of rawCandidates.slice(0, 6)) {
+      const id = String(c.contentid || '')
+      if (!id) continue
+      const full = byId.get(id)
+      if (!full) continue
+      validated.push({
+        contentid: id,
+        title: full.title || '',
+        addr1: full.addr1 || '',
+        zipcode: full.zipcode || '',
+        tel: full.tel || '',
+        firstimage: full.firstimage || full.firstimage2 || '',
+        mapx: full.mapx || '',
+        mapy: full.mapy || '',
+      })
+    }
+
+    if (rawCandidates.length > 0 && validated.length === 0) {
+      if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) chatMessages.value.splice(tempIdx, 1)
+      isProcessing.value = false
+      chatMessages.value.push({ role: 'bot', text: '죄송합니다. 대전 지역 음식점 관련 질문을 해주세요.' })
+      return
+    }
+
+    // replace temp indicator with reply + candidates
+    if (chatMessages.value[tempIdx] && chatMessages.value[tempIdx].temp) {
+      const replacement = { role: 'bot', text: reply }
+      if (validated.length) replacement.candidates = validated
+      chatMessages.value[tempIdx] = replacement
     } else {
       if (reply) chatMessages.value.push({ role: 'bot', text: reply })
+      if (validated.length) chatMessages.value.push({ role: 'bot', candidates: validated })
     }
-
-    // Trivial input detection (greetings, very short non-intent)
-    const isTrivialQuery = (s) => {
-      if (!s) return true
-      const low = s.toLowerCase()
-      const greetings = ['안녕', '안녕하세요', '하이', 'hi', 'hello', '반가워', '반갑']
-      if (greetings.some((g) => low.includes(g))) return true
-      // very short queries (1-2 characters) likely non-intent
-      if (low.replace(/\s+/g, '').length <= 2) return true
-      return false
-    }
-
-    // candidates가 있으면 그것을 enrich(이미지 조회 등)한 후 채팅 메시지로 추가
-    let candidates = json?.candidates || []
-    const trivial = isTrivialQuery(text) && !skipTrivialOnce.value
-    // reset the skip flag after using it
-    if (skipTrivialOnce.value) skipTrivialOnce.value = false
-    const kakaoKey = import.meta.env.VITE_KAKAO_REST_KEY || ''
-    if (candidates.length) {
-      for (const item of candidates) {
-        if (!item.firstimage && item.title) {
-          try {
-            // 1) try kakao if key provided
-            let gotImage = false
-            if (kakaoKey) {
-              try {
-                const q = encodeURIComponent(item.title + ' ' + (item.addr1 || ''))
-                const r = await fetch(`https://dapi.kakao.com/v2/local/search/keyword.json?query=${q}`, {
-                  headers: { Authorization: `KakaoAK ${kakaoKey}` },
-                })
-                if (r.ok) {
-                  const d = await r.json()
-                  const place = d?.documents?.[0]
-                  if (place && place.place_name) {
-                    item.firstimage = place?.place_url || item.firstimage || ''
-                    item.place_url = place?.place_url || item.place_url || ''
-                    item.mapx = item.mapx || place?.x || item.mapx
-                    item.mapy = item.mapy || place?.y || item.mapy
-                    gotImage = !!item.firstimage
-                  }
-                }
-              } catch (er) {
-                console.warn('Kakao image fetch failed', er)
-              }
-            }
-            // 2) if still no image, fallback to Unsplash (guarantees an image)
-            if (!item.firstimage) {
-              const imgUrl = `https://source.unsplash.com/featured/?${encodeURIComponent(item.title + ' restaurant')}`
-              item.firstimage = imgUrl
-            }
-            
-          } catch (er) {
-            console.warn('Kakao image fetch failed', er)
-          }
-        }
-      }
-    }
-
-    if (trivial) {
-      // For trivial inputs, prioritize showing follow-up options instead of candidates
-      const followups = buildFollowups(text)
-      chatMessages.value.push({ role: 'bot', followups })
-    } else {
-      if (candidates.length) {
-        chatMessages.value.push({ role: 'bot', candidates })
-      } else {
-        // no candidates -> provide follow-up options derived from local JSON
-        const followups = buildFollowups(text)
-        chatMessages.value.push({ role: 'bot', text: reply, followups })
-      }
-    }
+    isProcessing.value = false
   } catch (err) {
     console.error(err)
     chatMessages.value.push({ role: 'bot', text: '서버에 연결할 수 없습니다.' })
   }
 }
+
+// 자동 스크롤: 채팅 메시지 변경 시 하단으로 이동
+watch(
+  chatMessages,
+  async () => {
+    await nextTick()
+    try {
+      const el = chatLogRef.value
+      if (el) {
+        el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+      }
+    } catch (e) {
+      // ignore
+    }
+  },
+  { deep: true },
+)
 
 function handleFollowupClick(query) {
   // set the query and force one search even if query looks trivial
@@ -692,11 +940,24 @@ function handleFollowupClick(query) {
   setTimeout(() => sendChatMessage(), 50)
 }
 
-function makeKakaoLink(item) {
+function buildLLMMessages(systemPrompt, userText) {
+  // include recent conversation turns for context (limit to last 8 messages)
+  const recent = chatMessages.value.slice(-8)
+  const messages = [{ role: 'system', content: systemPrompt }]
+  for (const m of recent) {
+    if (m.role === 'user') messages.push({ role: 'user', content: m.text })
+    else if (m.role === 'bot' && m.text) messages.push({ role: 'assistant', content: m.text })
+  }
+  // finally include current user text
+  messages.push({ role: 'user', content: userText })
+  return messages
+}
+
+function makeMapLink(item) {
   const lat = item.mapy || ''
   const lng = item.mapx || ''
   const title = item.title || ''
-  if (lat && lng) return `https://map.kakao.com/link/map/${encodeURIComponent(title)},${lat},${lng}`
+  if (lat && lng) return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lng}#map=18/${lat}/${lng}`
   return '#'
 }
 
@@ -734,7 +995,10 @@ function onImgError(e, title) {
   <div class="app-shell">
     <header class="hero">
       <div class="hero-left">
-        <div class="brand">LocalHub</div>
+        <div class="brand">
+          <img class="brand-mascot" src="/assets/mascot.png" alt="골라유 마스코트" onerror="this.style.display='none'" />
+          골라유
+        </div>
         <nav class="nav-menu">
           <button
             v-for="tab in tabOptions"
@@ -761,9 +1025,15 @@ function onImgError(e, title) {
       <div class="map-card">
         <div class="card-title-row">
           <h2>식당 지도</h2>
-          <div class="search-row">
-            <input v-model="restaurantSearch" placeholder="식당 이름 또는 주소 검색" />
-            <button type="button" class="primary search-btn">🔍</button>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <div class="search-row">
+              <input v-model="restaurantSearch" placeholder="식당 이름 또는 주소 검색" />
+              <button type="button" class="primary search-btn">🔍</button>
+            </div>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <input v-model="blogQuery" placeholder="네이버 블로그 검색" style="width:220px;" />
+              <button type="button" class="primary" @click="searchNaverBlogs">블로그 검색</button>
+            </div>
           </div>
         </div>
 
@@ -783,7 +1053,7 @@ function onImgError(e, title) {
 
         <div id="kakao-map" class="kakao-map"></div>
         <div v-if="!mapReady && MAP_KEY" class="map-loading">지도를 불러오는 중입니다...</div>
-        <div v-else-if="!MAP_KEY" class="map-loading">카카오맵 키를 설정하면 실제 지도가 표시됩니다.</div>
+        <div v-else-if="!MAP_KEY" class="map-loading"></div>
 
         <!-- 세로 1줄 목록 형태로 교체된 영역 -->
         <div class="restaurant-list-container">
@@ -807,6 +1077,7 @@ function onImgError(e, title) {
             선택한 카테고리나 검색어에 해당하는 식당이 없습니다.
           </div>
         </div>
+        
       </div>
 
       <div class="review-card">
@@ -821,9 +1092,44 @@ function onImgError(e, title) {
           </div>
 
           <div class="kakao-place-info">
-            <a v-if="kakaoPlaceLink" :href="kakaoPlaceLink" target="_blank" rel="noreferrer">
-              카카오맵에서 위치 보기
+            <a v-if="mapLink" :href="mapLink" target="_blank" rel="noreferrer">
+              지도에서 위치 보기
             </a>
+          </div>
+
+          <div class="blog-results-store" style="margin-top:12px;">
+            <h4 style="margin:6px 0; font-size:13px;">관련 블로그</h4>
+            <div v-if="blogResults.length" style="display:flex; flex-direction:column; gap:8px; max-height:220px; overflow:auto;">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="font-size:12px; color:#6b7280;">{{ blogResults.length }}건</div>
+                <div>
+                  <button class="secondary" @click="batchAnalyzeAll">일괄 AI 판별</button>
+                </div>
+              </div>
+              <div v-for="(b, i) in blogResults" :key="i" style="padding:8px; background:#fff; border-radius:8px; border:1px solid rgba(0,0,0,0.04);">
+                <a :href="b.link" target="_blank" rel="noopener noreferrer" style="text-decoration:none; color:inherit;">
+                  <strong v-html="b.title"></strong>
+                </a>
+                <div style="font-size:12px; color:#6b7280; margin-top:4px;">{{ b.bloggername }} · {{ b.postdate }}</div>
+                <p style="margin:6px 0 0; font-size:13px; color:#4b5563;" v-html="b.description"></p>
+                <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+                  <button class="secondary" @click="summarizeBlog(b)">요약</button>
+                  <button class="primary" @click="analyzeBlog(b)">AI 판별</button>
+                  <div v-if="b.__loading" style="font-size:12px;color:#9ca3af;">분석 중...</div>
+                </div>
+                <div v-if="b.__summary" style="margin-top:8px; color:#4b5563; font-size:13px;">요약: {{ b.__summary }}</div>
+                <div v-if="b.__analysis" style="margin-top:8px; font-size:13px;">
+                  <div><strong>판정:</strong> {{ b.__analysis.verdict }}</div>
+                  <div><strong>AI 의심도:</strong> {{ b.__analysis.ai_writing_probability_percentage ?? 'N/A' }}%</div>
+                  <div><strong>이유:</strong>
+                    <ul>
+                      <li v-for="(r, ri) in b.__analysis.reasons" :key="ri">{{ r }}</li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-else style="color:#9ca3af; font-size:13px;">관련 블로그가 없습니다.</div>
           </div>
         </div>
 
@@ -912,8 +1218,10 @@ function onImgError(e, title) {
     </div>
 
     <button type="button" class="chat-toggle" @click="isChatOpen = !isChatOpen">
-      {{ isChatOpen ? '×' : '💬' }}
+      💬
     </button>
+
+    <img class="mascot-float" src="/assets/mascot.png" alt="mascot" onerror="this.style.display='none'" />
 
     <div v-if="isChatOpen" class="chat-float">
       <div class="chat-header">
@@ -921,7 +1229,7 @@ function onImgError(e, title) {
         <button type="button" class="chat-close" @click="isChatOpen = false">×</button>
       </div>
 
-      <div class="chat-log">
+      <div class="chat-log" ref="chatLogRef">
         <div v-for="(message, index) in chatMessages" :key="index" class="message" :class="message.role">
           <strong>{{ message.role === 'user' ? '나' : '챗봇' }}</strong>
           <p v-if="message.text">{{ message.text }}</p>
@@ -929,14 +1237,14 @@ function onImgError(e, title) {
           <!-- candidates가 있는 bot 메시지는 카드형 가로 스크롤로 표시 -->
               <div v-if="message.candidates && message.candidates.length" class="candidate-row" @wheel="onCandidateWheel">
             <div v-for="(r, i) in message.candidates" :key="i" class="candidate-card">
-              <a :href="r.place_url || makeKakaoLink(r)" target="_blank" rel="noopener noreferrer">
+              <a :href="r.place_url || makeMapLink(r)" target="_blank" rel="noopener noreferrer">
                 <div class="thumb-small">
                   <img v-if="r.firstimage" :src="r.firstimage" alt="img" loading="lazy" @error="onImgError($event, r.title)" />
                   <div v-else class="noimg">이미지 없음</div>
                 </div>
               </a>
               <div class="meta-small">
-                <strong class="title"><a :href="r.place_url || makeKakaoLink(r)" target="_blank" rel="noopener noreferrer">{{ r.title }}</a></strong>
+                <strong class="title"><a :href="r.place_url || makeMapLink(r)" target="_blank" rel="noopener noreferrer">{{ r.title }}</a></strong>
                 <div class="addr">{{ r.addr1 }} {{ r.addr2 || '' }}</div>
               </div>
             </div>
@@ -949,8 +1257,8 @@ function onImgError(e, title) {
       </div>
 
       <div class="chat-input-row">
-        <input v-model="chatInput" @keyup.enter="sendChatMessage" placeholder="질문을 입력하세요" />
-        <button type="button" @click="sendChatMessage">전송</button>
+        <input v-model="chatInput" @keyup.enter="sendChatMessage" :disabled="isProcessing" placeholder="질문을 입력하세요" />
+        <button type="button" @click="sendChatMessage" :disabled="isProcessing">{{ isProcessing ? '...' : '전송' }}</button>
       </div>
     </div>
   </div>
@@ -978,8 +1286,8 @@ function onImgError(e, title) {
   align-items: center;
   padding: 20px 28px;
   border-radius: 24px;
-  background: white;
-  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.03);
+  background: linear-gradient(90deg, #fff8f2, #ffffff);
+  box-shadow: 0 10px 30px rgba(224, 122, 59, 0.06);
   margin-bottom: 24px;
 }
 
@@ -992,8 +1300,43 @@ function onImgError(e, title) {
 .brand {
   font-size: 26px;
   font-weight: 800;
-  color: #3182f6;
+  color: #e07a3b;
 }
+
+.brand-mascot {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  margin-right: 10px;
+  transform: translateY(4px);
+}
+
+/* mascot animations and badge */
+@keyframes bob {
+  0% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
+  100% { transform: translateY(0); }
+}
+
+.brand-mascot, .mascot-float {
+  animation: bob 3s ease-in-out infinite;
+}
+
+.mascot-badge {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, rgba(255,155,87,1), rgba(224,122,59,1));
+  box-shadow: 0 3px 8px rgba(224,122,59,0.28);
+  border: 2px solid rgba(255,255,255,0.95);
+}
+.mascot-badge img { width: 56%; height: 56%; object-fit: contain; border-radius:50%; }
+.mascot-div-icon { background: transparent; }
+
+.brand-mascot:hover, .mascot-float:hover { transform: scale(1.06); transition: transform 160ms ease; }
 
 .nav-menu {
   display: flex;
@@ -1014,12 +1357,12 @@ function onImgError(e, title) {
 
 .nav-item:hover {
   color: #191f28;
-  background: #f2f4f6;
+  background: #fbf6f2;
 }
 
 .nav-item.active {
   color: white;
-  background: #3182f6;
+  background: #e07a3b;
 }
 
 .hero-badges {
@@ -1045,7 +1388,7 @@ function onImgError(e, title) {
 .badge-box span {
   font-size: 18px;
   font-weight: 700;
-  color: #3182f6;
+  color: #e07a3b;
 }
 
 .main-view {
@@ -1116,7 +1459,7 @@ function onImgError(e, title) {
   width: 100%;
   height: 380px;
   border-radius: 18px;
-  background: #f2f4f6;
+  background: #fbf6f2;
   border: none;
 }
 
@@ -1155,9 +1498,9 @@ function onImgError(e, title) {
 }
 
 .filter-chip.active {
-  background: #2563eb;
+  background: #bb4a1a;
   color: white;
-  border-color: #2563eb;
+  border-color: #bb4a1a;
 }
 
 /* 세로 목록형 식당 리스트 스타일 */
@@ -1198,8 +1541,8 @@ function onImgError(e, title) {
 }
 
 .restaurant-list-item.selected {
-  background: #eff6ff;
-  border-left: 4px solid #2563eb;
+  background: #fff6f0;
+  border-left: 4px solid #bb4a1a;
   padding-left: 12px;
 }
 
@@ -1213,8 +1556,8 @@ function onImgError(e, title) {
   align-self: flex-start;
   font-size: 10px;
   font-weight: 700;
-  color: #2563eb;
-  background: #dbeafe;
+  color: #2f855a;
+  background: #e6f4ec;
   padding: 2px 6px;
   border-radius: 4px;
 }
@@ -1271,13 +1614,13 @@ function onImgError(e, title) {
 .kakao-place-info a {
   display: inline-block;
   margin-top: 8px;
-  color: #2563eb;
+  color: #e07a3b;
   text-decoration: none;
 }
 
 .review-item {
   padding: 14px 0;
-  border-bottom: 1px solid #f2f4f6;
+  border-bottom: 1px solid #fbf6f2;
   position: relative;
 }
 
@@ -1332,15 +1675,15 @@ function onImgError(e, title) {
   display: inline-block;
   padding: 4px 10px;
   border-radius: 8px;
-  background: #e8f3ff;
-  color: #1b64da;
+  background: #fff3ea;
+  color: #8a3b15;
   font-weight: 600;
   font-size: 12px;
 }
 
 .restaurant-link {
   margin-top: 10px;
-  color: #3182f6;
+  color: #e07a3b;
   font-weight: 600;
   font-size: 14px;
 }
@@ -1355,7 +1698,7 @@ function onImgError(e, title) {
 }
 
 .delete-btn {
-  background: #f2f4f6;
+  background: #fbf6f2;
   color: #f04452;
   padding: 6px 10px;
   font-size: 12px;
@@ -1371,7 +1714,7 @@ function onImgError(e, title) {
   border: none;
   background: transparent;
   font-size: 20px;
-  color: #ffc107;
+  color: #ffb74d;
   cursor: pointer;
   padding: 0;
 }
@@ -1384,11 +1727,11 @@ function onImgError(e, title) {
   height: 58px;
   border-radius: 50%;
   border: none;
-  background: #3182f6;
+  background: linear-gradient(135deg, #ff9b57, #e07a3b);
   color: white;
   font-size: 26px;
   cursor: pointer;
-  box-shadow: 0 8px 20px rgba(49, 130, 246, 0.3);
+  box-shadow: 0 12px 30px rgba(224,122,59,0.22);
   transition: transform 0.2s;
 }
 
@@ -1442,16 +1785,16 @@ button {
 }
 
 button.primary {
-  background: #3182f6;
+  background: #e07a3b;
   color: white;
 }
 
 button.primary:hover {
-  background: #1b64da;
+  background: #8a3b15;
 }
 
 button.secondary {
-  background: #f2f4f6;
+  background: #fbf6f2;
   color: #4e5968;
 }
 
@@ -1467,12 +1810,25 @@ button.secondary:hover {
   height: 56px;
   border-radius: 50%;
   border: none;
-  background: #191f28;
+  background: linear-gradient(135deg, #ff8a3d, #e07a3b);
   color: white;
   font-size: 22px;
   cursor: pointer;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 10px 28px rgba(224,122,59,0.18);
   z-index: 90;
+}
+
+/* chat-mascot removed to avoid duplicate mascot */
+
+.mascot-float {
+  position: fixed;
+  right: 96px;
+  bottom: 18px;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  box-shadow: 0 8px 24px rgba(224,122,59,0.22);
+  z-index: 88;
 }
 
 .chat-float {
@@ -1520,13 +1876,13 @@ button.secondary:hover {
 .message {
   padding: 12px 14px;
   border-radius: 16px;
-  background: #f2f4f6;
+  background: #fbf6f2;
   font-size: 14px;
 }
 
 .message.bot {
-  background: #e8f3ff;
-  color: #1b64da;
+  background: #fff3ea;
+  color: #8a3b15;
 }
 
 .message strong {
