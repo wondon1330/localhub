@@ -1362,9 +1362,7 @@ function onImgError(e, title) {
                 {{ showMarkers ? '마커 숨기기' : '마커 보기' }}
               </button>
             </div>
-            <div style="display:flex; gap:6px; align-items:center;">
-              <div style="font-size:13px; color:#6b7280;">선택한 장소의 위치와 관련 블로그를 자동으로 표시합니다.</div>
-            </div>
+
           </div>
         </div>
 
